@@ -22,7 +22,9 @@ upcoming calculations when subsequent requests arrive.
 
 Inactive members are not unregistered or failed-creation cleanup candidates.
 Active targets, including unavailable reservations, consume upper node and
-resource limits. Synthetic upper-limit Nodes never enter scheduling snapshots
+resource limits. Each scale-up plan reads current accounting so partial acceptance
+and observation errors cannot expose stale headroom to a later plan.
+Synthetic upper-limit Nodes never enter scheduling snapshots
 or satisfy resource minimums.
 
 The provider owns operations, deadlines, failure notification, Kubernetes

@@ -17,6 +17,7 @@ limitations under the License.
 package clusterstate
 
 import (
+	"context"
 	"fmt"
 	"slices"
 
@@ -78,14 +79,28 @@ func (csr *ClusterStateRegistry) accountingContainsInstance(id string) bool {
 
 // NodesForUpperLimits adds missing active target reservations to the supplied
 // scheduling inventory. These copies must not be used for scheduling or minimums.
-func (csr *ClusterStateRegistry) NodesForUpperLimits(nodes []*apiv1.Node, templates map[string]*framework.NodeInfo) ([]*apiv1.Node, error) {
+func (csr *ClusterStateRegistry) NodesForUpperLimits(ctx context.Context, nodes []*apiv1.Node, templates map[string]*framework.NodeInfo) ([]*apiv1.Node, error) {
+	// Partial scale-ups can change target without registering a successful request.
+	targets := make(map[string]int)
+	for _, group := range csr.cloudProvider.NodeGroups(ctx) {
+		view, err := cloudprovider.GetNodeGroupAccounting(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		if view != nil {
+			targets[group.Id()] = view.TargetSize
+		} else if !cloudprovider.SuspendedNodesIncludedInTargetSize(group) {
+			target, err := group.TargetSize(ctx)
+			if err != nil {
+				return nil, err
+			}
+			targets[group.Id()] = target
+		}
+	}
 	csr.Lock()
 	defer csr.Unlock()
 	result := append([]*apiv1.Node(nil), nodes...)
-	for id, excluded := range csr.suspendedExcludedFromTarget {
-		if !excluded && csr.nodeGroupAccounting[id] == nil {
-			continue
-		}
+	for id, target := range targets {
 		readiness := csr.perNodeGroupReadiness[id]
 		present := 0
 		for _, node := range nodes {
@@ -93,7 +108,7 @@ func (csr *ClusterStateRegistry) NodesForUpperLimits(nodes []*apiv1.Node, templa
 				present++
 			}
 		}
-		target := csr.acceptableRanges[id].CurrentTarget
+		target = max(target, csr.acceptableRanges[id].CurrentTarget)
 		if view := csr.nodeGroupAccounting[id]; view != nil {
 			target = max(target, view.TargetSize)
 		}

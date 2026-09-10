@@ -229,7 +229,34 @@ func TestProviderOwnedExpiredFreshReservation(t *testing.T) {
 	csr.RegisterScaleUp(t.Context(), group, 1, now.Add(10*time.Minute))
 	require.NoError(t, csr.UpdateNodes(t.Context(), nodes[:2], now.Add(10*time.Minute)))
 	assert.Equal(t, 1, csr.calculateUpcomingNodes("ng", csr.perNodeGroupReadiness["ng"], csr.acceptableRanges["ng"]))
-	upper, err := csr.NodesForUpperLimits(nodes[:2], map[string]*framework.NodeInfo{"ng": framework.NewTestNodeInfo(nodes[0])})
+	upper, err := csr.NodesForUpperLimits(t.Context(), nodes[:2], map[string]*framework.NodeInfo{"ng": framework.NewTestNodeInfo(nodes[0])})
 	require.NoError(t, err)
 	assert.Len(t, upper, 4, "old unavailable capacity still consumes upper limits")
+}
+
+func TestProviderOwnedUpperLimitsReadsCurrentTargets(t *testing.T) {
+	for _, snapshot := range []bool{true, false} {
+		t.Run(fmt.Sprint(snapshot), func(t *testing.T) {
+			csr, group, nodes := newAccountingRegistry(t)
+			if !snapshot {
+				group.view = nil
+			}
+			require.NoError(t, csr.UpdateNodes(t.Context(), nodes, time.Now()))
+			if snapshot {
+				view := *group.view
+				view.TargetSize, view.UpcomingInactiveNodes = 3, 1
+				group.view = &view
+			} else {
+				group.NodeGroup.(*testprovider.TestNodeGroup).SetTargetSize(3)
+			}
+			templates := map[string]*framework.NodeInfo{"ng": framework.NewTestNodeInfo(nodes[0])}
+			upper, err := csr.NodesForUpperLimits(t.Context(), nodes[:2], templates)
+			require.NoError(t, err)
+			assert.Len(t, upper, 3, "accepted target must not wait for CSR recalculation")
+			group.err = fmt.Errorf("unknown accepted target")
+			upper, err = csr.NodesForUpperLimits(t.Context(), nodes[:2], templates)
+			require.ErrorContains(t, err, "unknown accepted target")
+			assert.Nil(t, upper, "failed reads must not reuse cached headroom")
+		})
+	}
 }

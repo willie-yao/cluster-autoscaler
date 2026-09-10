@@ -138,7 +138,7 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 	// Initialise binpacking limiter.
 	o.processors.BinpackingLimiter.InitBinpacking(o.autoscalingCtx, nodeGroups)
 
-	upperLimitNodes, err := o.clusterStateRegistry.NodesForUpperLimits(nodes, nodeInfos)
+	upperLimitNodes, err := o.clusterStateRegistry.NodesForUpperLimits(ctx, nodes, nodeInfos)
 	if err != nil {
 		return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err))
 	}
@@ -241,7 +241,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 	nodeGroups := o.autoscalingCtx.CloudProvider.NodeGroups(ctx)
 	scaleUpInfos := make([]nodegroupset.ScaleUpInfo, 0)
 
-	upperLimitNodes, err := o.clusterStateRegistry.NodesForUpperLimits(nodes, nodeInfos)
+	upperLimitNodes, err := o.clusterStateRegistry.NodesForUpperLimits(ctx, nodes, nodeInfos)
 	if err != nil {
 		return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err))
 	}

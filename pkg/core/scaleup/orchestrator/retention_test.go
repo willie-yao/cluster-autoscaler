@@ -47,11 +47,12 @@ import (
 type retentionLimitGroup struct {
 	cloudprovider.NodeGroup
 	snapshot *cloudprovider.NodeGroupAccountingSnapshot
+	err      error
 }
 
 func (g *retentionLimitGroup) SuspendedNodesIncludedInTargetSize() bool { return false }
 func (g *retentionLimitGroup) GetNodeGroupAccounting(context.Context) (*cloudprovider.NodeGroupAccountingSnapshot, error) {
-	return g.snapshot, nil
+	return g.snapshot, g.err
 }
 
 func TestRetentionUpperLimitsWithClosedAdmission(t *testing.T) {
@@ -60,6 +61,14 @@ func TestRetentionUpperLimitsWithClosedAdmission(t *testing.T) {
 
 func TestRetentionMinSizeUpperLimitsWithClosedAdmission(t *testing.T) {
 	testRetentionUpperLimitsWithClosedAdmission(t, true, []string{"pending", "terminal", "fresh"})
+}
+
+func TestRetentionUpperLimitsAfterPartialAcceptance(t *testing.T) {
+	for _, enforceMin := range []bool{false, true} {
+		t.Run(fmt.Sprintf("minimum=%t", enforceMin), func(t *testing.T) {
+			testRetentionUpperLimitsWithClosedAdmission(t, enforceMin, []string{"partial", "unknown"})
+		})
+	}
 }
 
 func TestSuspendedLegacyUpperLimits(t *testing.T) {
@@ -177,10 +186,20 @@ func testRetentionUpperLimitsWithClosedAdmission(t *testing.T, enforceMin bool, 
 					require.NoError(t, templates.Recompute(ctx, &autoscalingCtx, active, nil, taints.TaintConfig{}, now))
 					csr := clusterstate.NewNotifiedClusterStateRegistry(provider, autoscalingCtx.LogRecorder, coretest.NewBackoff(),
 						nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 5 * time.Minute}), templates)
+					published := a.snapshot
+					if mode == "partial" || mode == "unknown" {
+						before := *published
+						before.TargetSize, before.UpcomingInactiveNodes = 2, 0
+						a.snapshot = &before
+					}
 					require.NoError(t, csr.UpdateNodes(ctx, raw, now))
 					csr.RegisterFailedScaleUp(ctx, a, 2, cloudprovider.InstanceErrorInfo{ErrorClass: cloudprovider.OtherErrorClass, ErrorCode: "backoff"}, now)
 					upcoming, _ := csr.GetUpcomingNodes(ctx)
 					require.Empty(t, upcoming)
+					a.snapshot = published
+					if mode == "unknown" {
+						a.err = fmt.Errorf("unknown accepted target")
+					}
 					autoscalingCtx.ExpanderStrategy = coretest.NewMockReportingStrategy(t, nil, nil)
 					o := New()
 					o.Initialize(&autoscalingCtx, processors, csr, newEstimatorBuilder(), taints.TaintConfig{},
@@ -192,10 +211,17 @@ func testRetentionUpperLimitsWithClosedAdmission(t *testing.T, enforceMin bool, 
 					var scaleErr errors.AutoscalerError
 					if enforceMin {
 						result, scaleErr = o.ScaleUpToNodeGroupMinSize(ctx, active, templates.GetNodeInfos())
-						require.NoError(t, scaleErr)
-						assert.Len(t, result.ScaleUpInfos, headroom)
 					} else {
 						result, scaleErr = o.ScaleUp(ctx, []*apiv1.Pod{pod}, active, nil, templates.GetNodeInfos(), false)
+					}
+					if mode == "unknown" {
+						require.ErrorContains(t, scaleErr, "unknown accepted target")
+						assert.Zero(t, grown)
+						return
+					}
+					if enforceMin {
+						require.NoError(t, scaleErr)
+						assert.Len(t, result.ScaleUpInfos, headroom)
 					}
 					if headroom > 0 {
 						require.NoError(t, scaleErr)
