@@ -209,7 +209,10 @@ func CleanUpAndRecordFailedScaleDownEvent(ctx context.Context, autoscalingCtx *c
 		logger.Error(status.Err, msg, "node", klog.KObj(node), "statusErr", errMsg)
 	}
 	autoscalingCtx.Recorder.Eventf(node, apiv1.EventTypeWarning, "ScaleDownFailed", eventMsgFormat+": %v", status.Err)
-	taints.CleanToBeDeleted(ctx, node, autoscalingCtx.ClientSet, autoscalingCtx.CordonNodeBeforeTerminate)
+	if _, err := autoscalingCtx.CleanNodeToBeDeleted(ctx, node); err != nil {
+		logger.Error(err, "Failed to clean deletion taint", "node", klog.KObj(node))
+		autoscalingCtx.Recorder.Eventf(node, apiv1.EventTypeWarning, "ScaleDownFailed", "failed to clean deletion taint: %v", err)
+	}
 	nodeDeletionTracker.EndDeletion(ctx, nodeGroupId, node.Name, status)
 }
 

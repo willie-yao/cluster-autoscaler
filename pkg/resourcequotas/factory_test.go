@@ -22,19 +22,90 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/stretchr/testify/require"
 	apiv1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 	cptest "sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/test"
 	"sigs.k8s.io/cluster-autoscaler/pkg/context"
 	"sigs.k8s.io/cluster-autoscaler/pkg/processors/customresources"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/annotations"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/test"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/units"
 )
 
 type nodeExcludeFn func(node *apiv1.Node) bool
 
+type activeTargetQuotaGroup struct{ cloudprovider.NodeGroup }
+
+func (*activeTargetQuotaGroup) SuspendedNodesIncludedInTargetSize() bool { return false }
+
 func (n nodeExcludeFn) ExcludeFromTracking(node *apiv1.Node) bool {
 	return n(node)
+}
+
+func TestProviderOwnedCapacityDoesNotSatisfyMinimums(t *testing.T) {
+	for _, inactive := range []bool{true, false} {
+		nodes := []*apiv1.Node{
+			test.BuildTestNode("active-1", 1000, units.GiB),
+			test.BuildTestNode("active-2", 1000, units.GiB),
+			test.BuildTestNode("reserved", 1000, units.GiB),
+		}
+		if inactive {
+			nodes[2].Status.Conditions = []apiv1.NodeCondition{{Type: "Suspended", Status: apiv1.ConditionTrue}}
+		} else {
+			nodes[2].Annotations = map[string]string{annotations.NodeUpcomingAnnotation: "true"}
+		}
+		provider := cptest.NewTestCloudProviderBuilder().Build()
+		group := &activeTargetQuotaGroup{provider.BuildNodeGroup("ng", 0, 10, 3, true, false, "", nil)}
+		provider.InsertNodeGroup(group)
+		for _, node := range nodes {
+			provider.AddNode(group.Id(), node)
+		}
+		provider.SetResourceLimiter(cloudprovider.NewResourceLimiter(
+			map[string]int64{"cpu": 2, "memory": 2 * units.GiB},
+			map[string]int64{"cpu": 3, "memory": 3 * units.GiB}))
+		ctx := &context.AutoscalingContext{CloudProvider: provider}
+		minFactory := NewTrackerFactory(TrackerOptions{
+			CustomResourcesProcessor: &fakeCustomResourcesProcessor{}, QuotaProvider: NewCloudMinProvider(provider),
+		})
+		minTracker, err := minFactory.NewMinQuotasTracker(t.Context(), ctx, nodes)
+		require.NoError(t, err)
+		result, err := minTracker.CheckQuota(t.Context(), ctx, nil, nodes[0], 1)
+		require.NoError(t, err)
+		require.Zero(t, result.AllowedDelta, "unavailable capacity must not justify deleting an active Node")
+		maxFactory := NewTrackerFactory(TrackerOptions{
+			CustomResourcesProcessor: &fakeCustomResourcesProcessor{}, QuotaProvider: NewCloudMaxProvider(provider),
+		})
+		maxTracker, err := maxFactory.NewMaxQuotasTracker(t.Context(), ctx, nodes)
+		require.NoError(t, err)
+		result, err = maxTracker.CheckQuota(t.Context(), ctx, nil, nodes[0], 1)
+		require.NoError(t, err)
+		require.Zero(t, result.AllowedDelta, "upper-limit inputs still count reserved capacity")
+	}
+}
+
+func TestSuspendedLegacyMinimums(t *testing.T) {
+	provider := cptest.NewTestCloudProviderBuilder().Build()
+	provider.AddNodeGroup("ng", 0, 10, 3)
+	nodes := []*apiv1.Node{
+		test.BuildTestNode("active-1", 1000, units.GiB),
+		test.BuildTestNode("active-2", 1000, units.GiB),
+		test.BuildTestNode("suspended", 1000, units.GiB),
+	}
+	nodes[2].Status.Conditions = []apiv1.NodeCondition{{Type: "Suspended", Status: apiv1.ConditionTrue}}
+	for _, node := range nodes {
+		provider.AddNode("ng", node)
+	}
+	provider.SetResourceLimiter(cloudprovider.NewResourceLimiter(map[string]int64{"cpu": 2, "memory": 2 * units.GiB}, nil))
+	ctx := &context.AutoscalingContext{CloudProvider: provider}
+	factory := NewTrackerFactory(TrackerOptions{
+		CustomResourcesProcessor: &fakeCustomResourcesProcessor{}, QuotaProvider: NewCloudMinProvider(provider),
+	})
+	tracker, err := factory.NewMinQuotasTracker(t.Context(), ctx, nodes)
+	require.NoError(t, err)
+	result, err := tracker.CheckQuota(t.Context(), ctx, nil, nodes[0], 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.AllowedDelta, "non-opt-in suspended-inclusive minimum accounting is unchanged")
 }
 
 func TestNewMaxQuotasTracker(t *testing.T) {

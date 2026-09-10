@@ -44,7 +44,6 @@ import (
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/expiring"
 	kube_util "sigs.k8s.io/cluster-autoscaler/pkg/utils/kubernetes"
-	"sigs.k8s.io/cluster-autoscaler/pkg/utils/taints"
 
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -238,7 +237,9 @@ func (a *Actuator) taintNodesSync(ctx context.Context, NodeGroupViews []*budgets
 		}
 		// Clean up already applied taints in case of issues.
 		for taintedNode := range taintedNodes {
-			_, _ = taints.CleanToBeDeleted(ctx, taintedNode, a.autoscalingCtx.ClientSet, a.autoscalingCtx.CordonNodeBeforeTerminate)
+			if _, err := a.autoscalingCtx.CleanNodeToBeDeleted(ctx, taintedNode); err != nil {
+				klog.FromContext(ctx).Error(err, "Failed to clean deletion taint", "node", klog.KObj(taintedNode))
+			}
 		}
 		if a.autoscalingCtx.AutoscalingOptions.DynamicNodeDeleteDelayAfterTaintEnabled {
 			close(updateLatencyTracker.AwaitOrStopChan)
@@ -402,7 +403,7 @@ func (a *Actuator) scaleDownNodeToReport(ctx context.Context, node *apiv1.Node, 
 
 // taintNode taints the node with NoSchedule to prevent new pods scheduling on it.
 func (a *Actuator) taintNode(ctx context.Context, node *apiv1.Node) error {
-	if _, err := taints.MarkToBeDeleted(ctx, node, a.autoscalingCtx.ClientSet, a.autoscalingCtx.CordonNodeBeforeTerminate); err != nil {
+	if _, err := a.autoscalingCtx.MarkNodeToBeDeleted(ctx, node); err != nil {
 		a.autoscalingCtx.Recorder.Eventf(node, apiv1.EventTypeWarning, "ScaleDownFailed", "failed to mark the node as toBeDeleted/unschedulable: %v", err)
 		return errors.ToAutoscalerError(errors.ApiCallError, err)
 	}
@@ -411,6 +412,29 @@ func (a *Actuator) taintNode(ctx context.Context, node *apiv1.Node) error {
 }
 
 func (a *Actuator) createSnapshot(ctx context.Context, nodes []*apiv1.Node) (clustersnapshot.ClusterSnapshot, error) {
+	views, err := cloudprovider.ReadNodeGroupAccounting(ctx, a.autoscalingCtx.CloudProvider.NodeGroups(ctx))
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := cloudprovider.NormalizeNodeGroupObservations(nodes, views)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err = cloudprovider.FilterOutInactiveNodes(ctx, a.autoscalingCtx.CloudProvider, normalized, views)
+	if err != nil {
+		return nil, err
+	}
+	// Provider observations may include other Nodes. Only retain deletion candidates.
+	candidates := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		candidates[node.Name] = true
+	}
+	nodes = nil
+	for _, node := range normalized {
+		if candidates[node.Name] {
+			nodes = append(nodes, node)
+		}
+	}
 	snapshot := predicate.NewPredicateSnapshot(store.NewBasicSnapshotStore(), a.autoscalingCtx.FrameworkHandle, a.autoscalingCtx.DynamicResourceAllocationEnabled, a.autoscalingCtx.PredicateParallelism, a.autoscalingCtx.CSINodeAwareSchedulingEnabled, a.autoscalingCtx.SchedulerVerbosityOffset)
 	pods, err := a.autoscalingCtx.AllPodLister().List()
 	if err != nil {

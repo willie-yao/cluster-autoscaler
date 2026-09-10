@@ -21,7 +21,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 	"sigs.k8s.io/cluster-autoscaler/pkg/context"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/annotations"
 )
 
 // NodeFilter customizes what nodes should be included in usage calculations.
@@ -71,15 +73,26 @@ func (u *usageCalculator) calculateUsages(ctx gocontext.Context, autoscalingCtx 
 	for _, rl := range quotas {
 		usages[rl.ID()] = make(resourceList)
 	}
+	var groups map[string]cloudprovider.NodeGroup
 
 	for _, node := range nodes {
 		if u.nodeFilter != nil && u.nodeFilter.ExcludeFromTracking(node) {
 			continue
 		}
 
-		ng, err := autoscalingCtx.CloudProvider.NodeGroupForNode(ctx, node)
-		if err != nil {
-			logger.Error(err, "calculateUsages: failed to get node group for node, falling back to node capacity", "node", klog.KObj(node))
+		var ng cloudprovider.NodeGroup
+		if id := node.Annotations[annotations.NodeUpcomingGroupAnnotation]; id != "" && node.Annotations[annotations.NodeUpcomingAnnotation] == "true" {
+			if groups == nil {
+				groups = cloudprovider.NodeGroupListToMapById(autoscalingCtx.CloudProvider.NodeGroups(ctx))
+			}
+			ng = groups[id]
+		}
+		if ng == nil {
+			var err error
+			ng, err = autoscalingCtx.CloudProvider.NodeGroupForNode(ctx, node)
+			if err != nil {
+				logger.Error(err, "calculateUsages: failed to get node group for node, falling back to node capacity", "node", klog.KObj(node))
+			}
 		}
 		delta, err := u.nodeCache.totalNodeResources(ctx, autoscalingCtx, node, ng)
 		if err != nil {

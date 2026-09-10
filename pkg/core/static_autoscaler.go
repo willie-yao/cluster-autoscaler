@@ -264,20 +264,27 @@ func (a *StaticAutoscaler) Start() error {
 
 // cleanUpIfRequired removes ToBeDeleted taints added by a previous run of CA
 // the taints are removed only once per runtime
-func (a *StaticAutoscaler) cleanUpIfRequired(ctx context.Context) {
+func (a *StaticAutoscaler) cleanUpIfRequired(ctx context.Context) error {
 	logger := klog.FromContext(ctx)
 	if a.initialized {
-		return
+		return nil
 	}
 
 	// CA can die at any time. Removing taints that might have been left from the previous run.
 	if allNodes, err := a.AllNodeLister().List(); err != nil {
 		logger.Error(err, "Failed to list ready nodes, not cleaning up taints")
+		return err
 	} else {
 		// Make sure we are only cleaning taints from selected node groups.
 		selectedNodes := filterNodesFromSelectedGroups(ctx, a.CloudProvider, allNodes...)
-		taints.CleanAllToBeDeleted(ctx, selectedNodes,
-			a.AutoscalingContext.ClientSet, a.Recorder, a.CordonNodeBeforeTerminate)
+		for _, node := range selectedNodes {
+			if !taints.HasToBeDeletedTaint(node) {
+				continue
+			}
+			if _, err := a.CleanNodeToBeDeleted(ctx, node); err != nil {
+				return fmt.Errorf("failed to clean deletion taint on node %s: %w", node.Name, err)
+			}
+		}
 		if a.AutoscalingContext.AutoscalingOptions.MaxBulkSoftTaintCount == 0 {
 			// Clean old taints if soft taints handling is disabled
 			taints.CleanStaleDeletionCandidates(ctx, allNodes,
@@ -285,6 +292,7 @@ func (a *StaticAutoscaler) cleanUpIfRequired(ctx context.Context) {
 		}
 	}
 	a.initialized = true
+	return nil
 }
 
 func (a *StaticAutoscaler) initializeRemainingPdbTracker(ctx context.Context) caerrors.AutoscalerError {
@@ -306,7 +314,6 @@ func (a *StaticAutoscaler) initializeRemainingPdbTracker(ctx context.Context) ca
 // RunOnce iterates over node groups and scales them up/down if necessary
 func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) caerrors.AutoscalerError {
 	logger := klog.FromContext(ctx)
-	a.cleanUpIfRequired(ctx)
 	a.processorCallbacks.reset()
 	a.DebuggingSnapshotter.StartDataCollection(ctx)
 	defer a.DebuggingSnapshotter.Flush(ctx)
@@ -319,6 +326,23 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 	logger.V(4).Info("Starting main loop")
 
 	stateUpdateStart := time.Now()
+	scaleDownActuationStatus := a.scaleDownActuator.CheckStatus()
+	refreshStart := time.Now()
+	if err := a.CloudProvider.Refresh(ctx); err != nil {
+		return caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
+	}
+	metrics.UpdateDurationFromStart(ctx, metrics.CloudProviderRefresh, refreshStart)
+	if a.AutoscalingOptions.AsyncNodeGroupsEnabled {
+		a.clusterStateRegistry.Recalculate(ctx)
+	}
+	a.loopStartNotifier.Refresh(ctx)
+	accounting, err := cloudprovider.ReadNodeGroupAccounting(ctx, a.CloudProvider.NodeGroups(ctx))
+	if err != nil {
+		return caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
+	}
+	if err := a.cleanUpIfRequired(ctx); err != nil {
+		return caerrors.ToAutoscalerError(caerrors.ApiCallError, err)
+	}
 
 	var draSnapshot *drasnapshot.Snapshot
 	if a.AutoscalingContext.DynamicResourceAllocationEnabled && a.AutoscalingContext.DraProvider != nil {
@@ -339,10 +363,19 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 	}
 
 	// Get nodes and pods currently living on cluster
-	allNodes, readyNodes, typedErr := a.obtainNodeLists(ctx, draSnapshot, csiSnapshot)
+	allNodes, readyNodes, typedErr := a.obtainNodeListsWithAccounting(ctx, draSnapshot, csiSnapshot, accounting)
 	if typedErr != nil {
 		logger.Error(typedErr, "Failed to get node list")
 		return typedErr
+	}
+	rawNodes := allNodes
+	allNodes, err = cloudprovider.FilterOutInactiveNodes(ctx, a.CloudProvider, allNodes, accounting)
+	if err != nil {
+		return caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
+	}
+	readyNodes, err = cloudprovider.FilterOutInactiveNodes(ctx, a.CloudProvider, readyNodes, accounting)
+	if err != nil {
+		return caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
 	}
 
 	if abortLoop, err := a.processors.ActionableClusterProcessor.ShouldAbort(ctx, a.AutoscalingContext, allNodes, readyNodes, currentTime); abortLoop {
@@ -363,22 +396,6 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 		logger.Error(err, "Failed to get daemonset list")
 		return caerrors.ToAutoscalerError(caerrors.ApiCallError, err)
 	}
-
-	// Snapshot scale-down actuation status before cache refresh.
-	scaleDownActuationStatus := a.scaleDownActuator.CheckStatus()
-	// Call CloudProvider.Refresh before any other calls to cloud provider.
-	refreshStart := time.Now()
-	err = a.AutoscalingContext.CloudProvider.Refresh(ctx)
-	if a.AutoscalingOptions.AsyncNodeGroupsEnabled {
-		// Some node groups might have been created asynchronously, without registering in CSR.
-		a.clusterStateRegistry.Recalculate(ctx)
-	}
-	metrics.UpdateDurationFromStart(ctx, metrics.CloudProviderRefresh, refreshStart)
-	if err != nil {
-		logger.Error(err, "Failed to refresh cloud provider config")
-		return caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
-	}
-	a.loopStartNotifier.Refresh(ctx)
 
 	// Update node groups min/max and maximum number of nodes being set for all node groups after cloud provider refresh
 	maxNodesCount := 0
@@ -413,10 +430,11 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 
 	a.DebuggingSnapshotter.SetTemplateNodes(ctx, autoscalingCtx.TemplateNodeInfoRegistry.GetNodeInfos())
 
-	if typedErr := a.updateClusterState(ctx, allNodes, currentTime); typedErr != nil {
-		logger.Error(typedErr, "Failed to update cluster state")
-		return typedErr
+	if err := a.clusterStateRegistry.UpdateNodesWithAccounting(ctx, rawNodes, currentTime, accounting); err != nil {
+		a.scaleDownPlanner.CleanUpUnneededNodes(ctx)
+		return caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
 	}
+	core_utils.UpdateClusterStateMetrics(a.clusterStateRegistry)
 	metrics.UpdateDurationFromStart(ctx, metrics.UpdateState, stateUpdateStart)
 
 	scaleUpStatus := &status.ScaleUpStatus{Result: status.ScaleUpNotTried}
@@ -996,7 +1014,11 @@ func fixNodeGroupSize(ctx context.Context, autoscalingCtx *ca_context.Autoscalin
 				if err := nodeGroup.DecreaseTargetSize(ctx, delta); err != nil {
 					return fixed, fmt.Errorf("failed to decrease %s: %v", nodeGroup.Id(), err)
 				}
-				fixed = true
+				size, err := nodeGroup.TargetSize(ctx)
+				if err != nil {
+					return fixed, err
+				}
+				fixed = fixed || size != incorrectSize.ExpectedSize
 			}
 		}
 	}
@@ -1247,6 +1269,10 @@ func (a *StaticAutoscaler) ExitCleanUp() {
 }
 
 func (a *StaticAutoscaler) obtainNodeLists(ctx context.Context, draSnapshot *drasnapshot.Snapshot, csiSnapshot *csisnapshot.Snapshot) ([]*apiv1.Node, []*apiv1.Node, caerrors.AutoscalerError) {
+	return a.obtainNodeListsWithAccounting(ctx, draSnapshot, csiSnapshot, nil)
+}
+
+func (a *StaticAutoscaler) obtainNodeListsWithAccounting(ctx context.Context, draSnapshot *drasnapshot.Snapshot, csiSnapshot *csisnapshot.Snapshot, accounting map[string]*cloudprovider.NodeGroupAccountingSnapshot) ([]*apiv1.Node, []*apiv1.Node, caerrors.AutoscalerError) {
 	logger := klog.FromContext(ctx)
 	allNodes, err := a.AllNodeLister().List()
 	if err != nil {
@@ -1257,6 +1283,18 @@ func (a *StaticAutoscaler) obtainNodeLists(ctx context.Context, draSnapshot *dra
 	if err != nil {
 		logger.Error(err, "Failed to list ready nodes")
 		return nil, nil, caerrors.ToAutoscalerError(caerrors.ApiCallError, err)
+	}
+	if len(accounting) > 0 {
+		allNodes, err = cloudprovider.NormalizeNodeGroupObservations(allNodes, accounting)
+		if err != nil {
+			return nil, nil, caerrors.ToAutoscalerError(caerrors.CloudProviderError, err)
+		}
+		readyNodes = nil
+		for _, node := range allNodes {
+			if kube_util.IsNodeReadyAndSchedulable(node) {
+				readyNodes = append(readyNodes, node)
+			}
+		}
 	}
 	a.reportTaintsCount(allNodes)
 
@@ -1334,6 +1372,7 @@ func getUpcomingNodeInfos(ctx context.Context, upcomingCounts map[string]int, no
 				freshNodeInfo.Node().Annotations = make(map[string]string)
 			}
 			freshNodeInfo.Node().Annotations[annotations.NodeUpcomingAnnotation] = "true"
+			freshNodeInfo.Node().Annotations[annotations.NodeUpcomingGroupAnnotation] = nodeGroup
 
 			nodes = append(nodes, freshNodeInfo)
 		}

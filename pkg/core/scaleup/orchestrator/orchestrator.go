@@ -138,7 +138,11 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 	// Initialise binpacking limiter.
 	o.processors.BinpackingLimiter.InitBinpacking(o.autoscalingCtx, nodeGroups)
 
-	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, nodes)
+	upperLimitNodes, err := o.clusterStateRegistry.NodesForUpperLimits(nodes, nodeInfos)
+	if err != nil {
+		return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err))
+	}
+	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, upperLimitNodes)
 	if err != nil {
 		markedEquivalenceGroups := markAllGroupsAsUnschedulable(podEquivalenceGroups, ScaleUpExecutionErrorReason)
 		return status.UpdateScaleUpError(
@@ -152,7 +156,7 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 	now := time.Now()
 
 	// Filter out invalid node groups
-	validNodeGroups, skippedNodeGroups := o.filterValidScaleUpNodeGroups(ctx, nodeGroups, nodeInfos, tracker, len(nodes), now)
+	validNodeGroups, skippedNodeGroups := o.filterValidScaleUpNodeGroups(ctx, nodeGroups, nodeInfos, tracker, len(upperLimitNodes), now)
 
 	// Mark skipped node groups as processed.
 	for nodegroupID := range skippedNodeGroups {
@@ -163,7 +167,7 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 		validNodeGroups:      validNodeGroups,
 		podEquivalenceGroups: podEquivalenceGroups,
 		nodeInfos:            nodeInfos,
-		nodes:                nodes,
+		nodes:                upperLimitNodes,
 		unschedulablePods:    unschedulablePods,
 		allOrNothing:         allOrNothing,
 		now:                  now,
@@ -237,7 +241,12 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 	nodeGroups := o.autoscalingCtx.CloudProvider.NodeGroups(ctx)
 	scaleUpInfos := make([]nodegroupset.ScaleUpInfo, 0)
 
-	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, nodes)
+	upperLimitNodes, err := o.clusterStateRegistry.NodesForUpperLimits(nodes, nodeInfos)
+	if err != nil {
+		return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err))
+	}
+	currentNodeCount := len(upperLimitNodes)
+	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, upperLimitNodes)
 	if err != nil {
 		return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err).AddPrefix("could not create quotas tracker: "))
 	}
@@ -283,10 +292,20 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 		}
 		newNodeCount = checkResult.AllowedDelta
 
-		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, targetSize)
+		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, currentNodeCount)
 		if err != nil {
 			logger.Info("ScaleUpToNodeGroupMinSize: failed to get capped node count", "err", err)
 			continue
+		}
+		if newNodeCount <= 0 {
+			continue
+		}
+		consumed, err := tracker.ConsumeQuota(ctx, o.autoscalingCtx, ng, nodeInfo.Node(), newNodeCount)
+		if err != nil {
+			return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err))
+		}
+		if consumed.AllowedDelta != newNodeCount {
+			return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.NewAutoscalerError(errors.InternalError, "planned minimum-size increase exceeds resource quota"))
 		}
 
 		info := nodegroupset.ScaleUpInfo{
@@ -296,6 +315,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 			MaxSize:     ng.MaxSize(ctx),
 		}
 		scaleUpInfos = append(scaleUpInfos, info)
+		currentNodeCount += newNodeCount
 	}
 
 	if len(scaleUpInfos) == 0 {

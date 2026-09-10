@@ -143,6 +143,8 @@ type ClusterStateRegistry struct {
 	interrupt                          chan struct{}
 	nodeGroupConfigProcessor           nodegroupconfig.NodeGroupConfigProcessor
 	asyncNodeGroupStateChecker         asyncnodegroups.AsyncNodeGroupStateChecker
+	nodeGroupAccounting                map[string]*cloudprovider.NodeGroupAccountingSnapshot
+	suspendedExcludedFromTarget        map[string]bool
 
 	templateNodeInfoRegistry TemplateNodeInfoRegistry
 	backoff                  backoff.Backoff
@@ -350,8 +352,11 @@ func (csr *ClusterStateRegistry) updateScaleRequests(ctx context.Context, curren
 			continue
 		}
 		if !csr.areThereUpcomingNodesInNodeGroup(ctx, nodeGroupName) {
-			// scale up finished successfully, remove request
 			delete(csr.scaleUpRequests, nodeGroupName)
+			if view := csr.nodeGroupAccounting[nodeGroupName]; view != nil && view.UnavailableTargetNodes > 0 {
+				logger.V(4).Info("Removing scale-up request with unavailable provider reservations", "nodeGroupName", nodeGroupName)
+				continue
+			}
 			logger.V(4).Info("Scale up in group finished successfully", "nodeGroupName", nodeGroupName, "duration", currentTime.Sub(scaleUpRequest.Time))
 			continue
 		}
@@ -419,19 +424,50 @@ func (csr *ClusterStateRegistry) RegisterFailedScaleDown(_ cloudprovider.NodeGro
 
 // UpdateNodes updates the state of the nodes in the ClusterStateRegistry and recalculates the stats
 func (csr *ClusterStateRegistry) UpdateNodes(ctx context.Context, nodes []*apiv1.Node, currentTime time.Time) error {
-	csr.updateNodeGroupMetrics(ctx)
-	targetSizes, err := getTargetSizes(ctx, csr.cloudProvider)
+	views, err := cloudprovider.ReadNodeGroupAccounting(ctx, csr.cloudProvider.NodeGroups(ctx))
 	if err != nil {
 		return err
+	}
+	nodes, err = cloudprovider.NormalizeNodeGroupObservations(nodes, views)
+	if err != nil {
+		return err
+	}
+	return csr.UpdateNodesWithAccounting(ctx, nodes, currentTime, views)
+}
+
+// UpdateNodesWithAccounting consumes Nodes already normalized with the supplied
+// observations and any resource/startup readiness filters.
+func (csr *ClusterStateRegistry) UpdateNodesWithAccounting(ctx context.Context, nodes []*apiv1.Node, currentTime time.Time, views map[string]*cloudprovider.NodeGroupAccountingSnapshot) error {
+	csr.updateNodeGroupMetrics(ctx)
+	var err error
+	targetSizes := make(map[string]int)
+	excluded := make(map[string]bool)
+	instances := make(map[string][]cloudprovider.Instance)
+	for _, group := range csr.cloudProvider.NodeGroups(ctx) {
+		id := group.Id()
+		excluded[id] = !cloudprovider.SuspendedNodesIncludedInTargetSize(group)
+		if view := views[id]; view != nil {
+			targetSizes[id], instances[id] = view.TargetSize, view.Instances
+			continue
+		}
+		targetSizes[id], err = group.TargetSize(ctx)
+		if err != nil {
+			return err
+		}
+		if csr.IsNodeGroupScalingUp(ctx, id) {
+			csr.cloudProviderNodeInstancesCache.InvalidateCacheEntry(ctx, group)
+		}
+		instances[id], err = csr.cloudProviderNodeInstancesCache.GetCloudProviderNodeInstancesForNodeGroup(ctx, group)
+		if err != nil {
+			return err
+		}
 	}
 	metrics.UpdateNodeGroupTargetSize(targetSizes)
-
-	cloudProviderNodeInstances, err := csr.getCloudProviderNodeInstances(ctx)
-	if err != nil {
-		return err
-	}
+	csr.Lock()
+	csr.nodeGroupAccounting, csr.suspendedExcludedFromTarget = views, excluded
+	csr.Unlock()
 	csr.updateClusterStateRegistry(ctx, nodes,
-		cloudProviderNodeInstances,
+		instances,
 		currentTime,
 		targetSizes,
 	)
@@ -441,7 +477,7 @@ func (csr *ClusterStateRegistry) UpdateNodes(ctx context.Context, nodes []*apiv1
 func (csr *ClusterStateRegistry) updateClusterStateRegistry(ctx context.Context, nodes []*apiv1.Node,
 	cloudProviderNodeInstances map[string][]cloudprovider.Instance, currentTime time.Time, targetSizes map[string]int) {
 	cloudProviderNodesRemoved := csr.getCloudProviderDeletedNodes(ctx, nodes)
-	notRegistered := getNotRegisteredNodes(nodes, cloudProviderNodeInstances, currentTime)
+	notRegistered := getNotRegisteredNodes(nodes, csr.registrationInstances(cloudProviderNodeInstances), currentTime)
 
 	csr.Lock()
 	defer csr.Unlock()
@@ -469,6 +505,7 @@ func (csr *ClusterStateRegistry) Recalculate(ctx context.Context) {
 	targetSizes, err := getTargetSizes(ctx, csr.cloudProvider)
 	if err != nil {
 		logger.Info("Failed to get target sizes, when trying to recalculate cluster state", "err", err)
+		return
 	}
 
 	csr.Lock()
@@ -480,6 +517,14 @@ func (csr *ClusterStateRegistry) Recalculate(ctx context.Context) {
 func getTargetSizes(ctx context.Context, cp cloudprovider.CloudProvider) (map[string]int, error) {
 	result := make(map[string]int)
 	for _, ng := range cp.NodeGroups(ctx) {
+		view, err := cloudprovider.GetNodeGroupAccounting(ctx, ng)
+		if err != nil {
+			return nil, err
+		}
+		if view != nil {
+			result[ng.Id()] = view.TargetSize
+			continue
+		}
 		size, err := ng.TargetSize(ctx)
 		if err != nil {
 			return map[string]int{}, err
@@ -496,8 +541,14 @@ func (csr *ClusterStateRegistry) IsClusterHealthy() bool {
 
 	totalUnready := len(csr.totalReadiness.Unready)
 
+	totalNodes := len(csr.nodes)
+	for id, readiness := range csr.perNodeGroupReadiness {
+		if csr.suspendedExcludedFromTarget[id] {
+			totalNodes -= len(readiness.Suspended)
+		}
+	}
 	if totalUnready > csr.config.OkTotalUnreadyCount &&
-		float64(totalUnready) > csr.config.MaxTotalUnreadyPercentage/100.0*float64(len(csr.nodes)) {
+		float64(totalUnready) > csr.config.MaxTotalUnreadyPercentage/100.0*float64(totalNodes) {
 		return false
 	}
 
@@ -524,14 +575,18 @@ func (csr *ClusterStateRegistry) IsNodeGroupHealthy(ctx context.Context, nodeGro
 	}
 
 	unjustifiedUnready := 0
+	suspended := len(readiness.Suspended)
+	if csr.suspendedExcludedFromTarget[nodeGroupName] {
+		suspended = 0
+	}
 	// Too few nodes, something is missing. Below the expected node count.
-	if len(readiness.Ready)+len(readiness.Suspended) < acceptable.MinNodes {
-		unjustifiedUnready += acceptable.MinNodes - len(readiness.Ready) - len(readiness.Suspended)
+	if len(readiness.Ready)+suspended < acceptable.MinNodes {
+		unjustifiedUnready += acceptable.MinNodes - len(readiness.Ready) - suspended
 	}
 	// TODO: verify against max nodes as well.
 	if unjustifiedUnready > csr.config.OkTotalUnreadyCount &&
 		float64(unjustifiedUnready) > csr.config.MaxTotalUnreadyPercentage/100.0*
-			float64(len(readiness.Ready)+len(readiness.Unready)+len(readiness.NotStarted)+len(readiness.Suspended)) {
+			float64(len(readiness.Ready)+len(readiness.Unready)+len(readiness.NotStarted)+suspended) {
 		return false
 	}
 
@@ -598,10 +653,8 @@ func (csr *ClusterStateRegistry) getUpcomingNodesInNodeGroup(ctx context.Context
 			// No need to warn if node group has size 0 (was scaled to 0 before).
 			logger.Info("Failed to find readiness information", "nodeGroupName", nodeGroupName)
 		}
-		return acceptable.CurrentTarget, true
 	}
-	// TODO: Unify the logic determining the input to calculateUpcomingNodesInNodeGroup() with GetUpcomingNodes().
-	return calculateUpcomingNodesInNodeGroup(readiness, acceptable), true
+	return csr.calculateUpcomingNodes(nodeGroupName, readiness, acceptable), true
 }
 
 func (csr *ClusterStateRegistry) areThereUpcomingNodesInNodeGroup(ctx context.Context, nodeGroupName string) bool {
@@ -620,6 +673,9 @@ func (csr *ClusterStateRegistry) IsNodeGroupRegistered(nodeGroupName string) boo
 
 // IsNodeGroupAtTargetSize returns true if the number of nodes provisioned in the group is equal to the target number of nodes.
 func (csr *ClusterStateRegistry) IsNodeGroupAtTargetSize(nodeGroupName string) bool {
+	if view := csr.nodeGroupAccounting[nodeGroupName]; view != nil && view.UnavailableTargetNodes > 0 {
+		return false
+	}
 	upcoming, ok := csr.getUpcomingNodesInNodeGroup(context.TODO(), nodeGroupName)
 	if !ok {
 		return false
@@ -714,12 +770,7 @@ type Readiness struct {
 }
 
 func isSuspendedNode(node *apiv1.Node) bool {
-	for _, condition := range node.Status.Conditions {
-		if condition.Type == suspendedNodeCondition {
-			return condition.Status == apiv1.ConditionTrue
-		}
-	}
-	return false
+	return cloudprovider.IsNodeSuspended(node)
 }
 
 func (csr *ClusterStateRegistry) updateReadinessStats(ctx context.Context, currentTime time.Time) {
@@ -827,10 +878,14 @@ func (csr *ClusterStateRegistry) updateIncorrectNodeGroupSizes(ctx context.Conte
 			continue
 		}
 		unregisteredNodes := len(readiness.Unregistered) + len(readiness.LongUnregistered)
-		if len(readiness.Registered) > acceptableRange.CurrentTarget ||
-			len(readiness.Registered) < acceptableRange.CurrentTarget-unregisteredNodes {
+		registered := len(readiness.Registered)
+		if csr.suspendedExcludedFromTarget[nodeGroup.Id()] {
+			registered -= len(readiness.Suspended)
+		}
+		if registered > acceptableRange.CurrentTarget ||
+			registered < acceptableRange.CurrentTarget-unregisteredNodes {
 			incorrect := IncorrectNodeGroupSize{
-				CurrentSize:   len(readiness.Registered),
+				CurrentSize:   registered,
 				ExpectedSize:  acceptableRange.CurrentTarget,
 				FirstObserved: currentTime,
 			}
@@ -1126,8 +1181,7 @@ func (csr *ClusterStateRegistry) GetUpcomingNodes(ctx context.Context) (upcoming
 		}
 		readiness := csr.perNodeGroupReadiness[id]
 		ar := csr.acceptableRanges[id]
-		// TODO: Unify the logic determining the input to calculateUpcomingNodesInNodeGroup() with getUpcomingNodesInNodeGroup().
-		newNodes := calculateUpcomingNodesInNodeGroup(readiness, ar)
+		newNodes := csr.calculateUpcomingNodes(id, readiness, ar)
 		if newNodes <= 0 {
 			// Negative value is unlikely but theoretically possible.
 			continue
@@ -1139,8 +1193,15 @@ func (csr *ClusterStateRegistry) GetUpcomingNodes(ctx context.Context) (upcoming
 		// schedulable, preventing ScaleUp from ever being called and considering
 		// alternative node groups.
 		if _, hasScaleUpRequest := csr.scaleUpRequests[id]; !hasScaleUpRequest {
-			logger.V(4).Info("Skipping upcoming nodes for node group: no active scale-up request", "nodeCount", newNodes, "nodeGroupId", id)
-			continue
+			if view := csr.nodeGroupAccounting[id]; view != nil {
+				newNodes = min(newNodes, view.UpcomingInactiveNodes)
+			} else {
+				newNodes = 0
+			}
+			if newNodes == 0 {
+				logger.V(4).Info("Skipping upcoming nodes for node group: no active scale-up request", "nodeGroupId", id)
+				continue
+			}
 		}
 		if backoffStatus := csr.BackoffStatusForNodeGroup(ctx, nodeGroup, time.Now()); backoffStatus.IsBackedOff {
 			logger.V(4).Info("Skipping upcoming nodes for backed-off node group", "nodeCount", newNodes, "nodeGroupId", id, "errorMessage", backoffStatus.ErrorInfo.ErrorMessage)
@@ -1215,6 +1276,9 @@ func expectedToRegister(instance cloudprovider.Instance) bool {
 func (csr *ClusterStateRegistry) getCloudProviderDeletedNodes(ctx context.Context, allNodes []*apiv1.Node) []*apiv1.Node {
 	nodesRemoved := make([]*apiv1.Node, 0)
 	for _, node := range allNodes {
+		if csr.accountingContainsInstance(node.Spec.ProviderID) {
+			continue
+		}
 		if !csr.hasCloudProviderInstance(ctx, node) {
 			nodesRemoved = append(nodesRemoved, node)
 		}
@@ -1243,8 +1307,11 @@ func (csr *ClusterStateRegistry) GetAutoscaledNodesCount() (currentSize, targetS
 	for _, accRange := range csr.acceptableRanges {
 		targetSize += accRange.CurrentTarget
 	}
-	for _, readiness := range csr.perNodeGroupReadiness {
+	for id, readiness := range csr.perNodeGroupReadiness {
 		currentSize += len(readiness.Registered) - len(readiness.NotStarted)
+		if csr.suspendedExcludedFromTarget[id] {
+			currentSize -= len(readiness.Suspended)
+		}
 	}
 	return currentSize, targetSize
 }
@@ -1254,8 +1321,8 @@ func (csr *ClusterStateRegistry) handleInstanceCreationErrors(ctx context.Contex
 
 	for _, nodeGroup := range nodeGroups {
 		csr.handleInstanceCreationErrorsForNodeGroup(ctx, nodeGroup,
-			csr.cloudProviderNodeInstances[nodeGroup.Id()],
-			csr.previousCloudProviderNodeInstances[nodeGroup.Id()],
+			csr.activeInstances(nodeGroup.Id(), csr.cloudProviderNodeInstances[nodeGroup.Id()]),
+			csr.activeInstances(nodeGroup.Id(), csr.previousCloudProviderNodeInstances[nodeGroup.Id()]),
 			currentTime)
 	}
 }
@@ -1372,7 +1439,7 @@ func (csr *ClusterStateRegistry) GetCreatedNodesWithErrors() map[string][]*apiv1
 
 	nodesWithCreateErrors := make(map[string][]*apiv1.Node)
 	for nodeGroupId, nodeGroupInstances := range csr.cloudProviderNodeInstances {
-		_, _, instancesByErrorCode := csr.buildInstanceToErrorCodeMappings(nodeGroupInstances)
+		_, _, instancesByErrorCode := csr.buildInstanceToErrorCodeMappings(csr.activeInstances(nodeGroupId, nodeGroupInstances))
 		for _, instances := range instancesByErrorCode {
 			for _, instance := range instances {
 				nodesWithCreateErrors[nodeGroupId] = append(nodesWithCreateErrors[nodeGroupId], FakeNode(instance, cloudprovider.FakeNodeCreateError))

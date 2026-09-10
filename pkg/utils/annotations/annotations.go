@@ -19,6 +19,8 @@ package annotations
 const (
 	// NodeUpcomingAnnotation is an annotation CA adds to nodes which are upcoming.
 	NodeUpcomingAnnotation = "cluster-autoscaler.k8s.io/upcoming-node"
+	// NodeUpcomingGroupAnnotation identifies the group of a synthetic capacity Node.
+	NodeUpcomingGroupAnnotation = "cluster-autoscaler.k8s.io/upcoming-node-group"
 
 	// PodScaleUpDelayAnnotationKey is an annotation how long pod can wait to be scaled up.
 	PodScaleUpDelayAnnotationKey = "cluster-autoscaler.kubernetes.io/pod-scale-up-delay"

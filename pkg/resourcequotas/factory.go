@@ -21,8 +21,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 	"sigs.k8s.io/cluster-autoscaler/pkg/context"
 	"sigs.k8s.io/cluster-autoscaler/pkg/processors/customresources"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/annotations"
 )
 
 // TrackerFactory builds quota trackers.
@@ -70,7 +72,17 @@ func (f *TrackerFactory) NewQuotasTracker(ctx gocontext.Context, autoscalingCtx 
 // quota returned by the Provider. Then, based on usages and limits it calculates
 // how many resources can be still removed from the cluster. Returns a Tracker object.
 func (f *TrackerFactory) NewMinQuotasTracker(ctx gocontext.Context, autoscalingCtx *context.AutoscalingContext, nodes []*corev1.Node) (*Tracker, error) {
-	return f.newQuotasTracker(ctx, autoscalingCtx, nodes, true /* isMinEnforcement */)
+	nodes, err := cloudprovider.FilterOutInactiveNodes(ctx, autoscalingCtx.CloudProvider, nodes, nil)
+	if err != nil {
+		return nil, err
+	}
+	available := make([]*corev1.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Annotations[annotations.NodeUpcomingAnnotation] != "true" {
+			available = append(available, node)
+		}
+	}
+	return f.newQuotasTracker(ctx, autoscalingCtx, available, true /* isMinEnforcement */)
 }
 
 // newQuotasTracker builds a new Tracker for either minimum or maximum limits enforcement.
