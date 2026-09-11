@@ -236,6 +236,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 	now := time.Now()
 	nodeGroups := o.autoscalingCtx.CloudProvider.NodeGroups(ctx)
 	scaleUpInfos := make([]nodegroupset.ScaleUpInfo, 0)
+	currentNodeCount := len(nodes)
 
 	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, nodes)
 	if err != nil {
@@ -283,10 +284,21 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 		}
 		newNodeCount = checkResult.AllowedDelta
 
-		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, targetSize)
+		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, currentNodeCount)
 		if err != nil {
 			logger.Info("ScaleUpToNodeGroupMinSize: failed to get capped node count", "err", err)
 			continue
+		}
+
+		if newNodeCount <= 0 {
+			continue
+		}
+		consumed, err := tracker.ConsumeQuota(ctx, o.autoscalingCtx, ng, nodeInfo.Node(), newNodeCount)
+		if err != nil {
+			return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.ToAutoscalerError(errors.InternalError, err))
+		}
+		if consumed.AllowedDelta != newNodeCount {
+			return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.NewAutoscalerError(errors.InternalError, "planned minimum-size increase exceeds resource quota"))
 		}
 
 		info := nodegroupset.ScaleUpInfo{
@@ -296,6 +308,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 			MaxSize:     ng.MaxSize(ctx),
 		}
 		scaleUpInfos = append(scaleUpInfos, info)
+		currentNodeCount += newNodeCount
 	}
 
 	if len(scaleUpInfos) == 0 {

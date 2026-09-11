@@ -22,11 +22,13 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/stretchr/testify/require"
 	apiv1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 	cptest "sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/test"
 	"sigs.k8s.io/cluster-autoscaler/pkg/context"
 	"sigs.k8s.io/cluster-autoscaler/pkg/processors/customresources"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/annotations"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/test"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/units"
 )
@@ -447,5 +449,46 @@ func TestNewMinQuotasTracker(t *testing.T) {
 				t.Errorf("CheckQuota() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestUpcomingNodesDoNotSatisfyResourceMinimums(t *testing.T) {
+	for _, resourceName := range []string{cloudprovider.ResourceNameCores, cloudprovider.ResourceNameMemory} {
+		for _, upcoming := range []bool{false, true} {
+			name := resourceName + "/real"
+			if upcoming {
+				name = resourceName + "/upcoming"
+			}
+			t.Run(name, func(t *testing.T) {
+				nodes := []*apiv1.Node{test.BuildTestNode("real-1", 1000, units.GiB), test.BuildTestNode("real-2", 1000, units.GiB), test.BuildTestNode("third", 1000, units.GiB)}
+				if upcoming {
+					nodes[2].Annotations = map[string]string{annotations.NodeUpcomingAnnotation: "true"}
+				}
+				provider := cptest.NewTestCloudProviderBuilder().Build()
+				provider.AddNodeGroup("ordinary", 0, 10, 3)
+				for _, node := range nodes {
+					provider.AddNode("ordinary", node)
+				}
+				floor := int64(2)
+				if resourceName == cloudprovider.ResourceNameMemory {
+					floor *= units.GiB
+				}
+				quota := &FakeQuota{Name: "resource minimum", AppliesToFn: MatchEveryNode, LimitsVal: map[string]int64{resourceName: floor}}
+				factory := NewTrackerFactory(TrackerOptions{CustomResourcesProcessor: &fakeCustomResourcesProcessor{}, QuotaProvider: NewFakeProvider([]Quota{quota})})
+				ac := &context.AutoscalingContext{CloudProvider: provider}
+				tracker, err := factory.NewMinQuotasTracker(t.Context(), ac, nodes)
+				require.NoError(t, err)
+				group, err := provider.NodeGroupForNode(t.Context(), nodes[0])
+				require.NoError(t, err)
+				result, err := tracker.CheckQuota(t.Context(), ac, group, nodes[0], 1)
+				require.NoError(t, err)
+				want := 1
+				if upcoming {
+					want = 0
+				}
+				require.Equal(t, want, result.AllowedDelta)
+				require.Len(t, nodes, 3)
+			})
+		}
 	}
 }

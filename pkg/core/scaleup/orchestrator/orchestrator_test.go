@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
@@ -2662,4 +2663,68 @@ func (m *mockMetrics) RegisterFailedNodeCreations(reason metrics.FailedScaleUpRe
 
 func (m *mockMetrics) RegisterScaleUp(nodesCount int, gpuResourceName string, gpuType string, draDriverNames string) {
 	m.Called(nodesCount, gpuResourceName, gpuType, draDriverNames)
+}
+
+func TestScaleUpToMinSizeRespectsSharedQuota(t *testing.T) {
+	type groupConfig struct {
+		Name                          string
+		MinSize, MaxSize, InitialSize int
+	}
+	for _, tc := range []struct {
+		name         string
+		groups       []groupConfig
+		maxNodes     int
+		limits       map[string]int64
+		wantIncrease int
+	}{
+		{name: "cluster already at node limit", groups: []groupConfig{{Name: "ng1", MinSize: 2, MaxSize: 10, InitialSize: 1}, {Name: "ng2", MinSize: 2, MaxSize: 10, InitialSize: 2}}, maxNodes: 3},
+		{name: "shared node headroom", groups: []groupConfig{{Name: "ng1", MinSize: 3, MaxSize: 10, InitialSize: 1}, {Name: "ng2", MinSize: 3, MaxSize: 10, InitialSize: 1}}, maxNodes: 3, wantIncrease: 1},
+		{name: "shared CPU headroom", groups: []groupConfig{{Name: "ng1", MinSize: 3, MaxSize: 10, InitialSize: 1}, {Name: "ng2", MinSize: 3, MaxSize: 10, InitialSize: 1}}, limits: map[string]int64{cloudprovider.ResourceNameCores: 3}, wantIncrease: 1},
+		{name: "shared memory headroom", groups: []groupConfig{{Name: "ng1", MinSize: 3, MaxSize: 10, InitialSize: 1}, {Name: "ng2", MinSize: 3, MaxSize: 10, InitialSize: 1}}, limits: map[string]int64{cloudprovider.ResourceNameMemory: 3 * units.GiB}, wantIncrease: 1},
+		{name: "unlimited ordinary groups", groups: []groupConfig{{Name: "ng1", MinSize: 2, MaxSize: 10, InitialSize: 1}, {Name: "ng2", MinSize: 2, MaxSize: 10, InitialSize: 1}}, wantIncrease: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			totalIncrease := 0
+			provider := testprovider.NewTestCloudProviderBuilder().WithOnScaleUp(func(_ string, increase int) error {
+				require.Positive(t, increase)
+				totalIncrease += increase
+				return nil
+			}).Build()
+			provider.SetResourceLimiter(cloudprovider.NewResourceLimiter(nil, tc.limits))
+			var nodes []*apiv1.Node
+			for _, group := range tc.groups {
+				provider.AddNodeGroup(group.Name, group.MinSize, group.MaxSize, group.InitialSize)
+				for i := 0; i < group.InitialSize; i++ {
+					node := BuildTestNode(fmt.Sprintf("%s-%d", group.Name, i), 1000, units.GiB)
+					SetNodeReadyState(node, true, time.Now())
+					provider.AddNode(group.Name, node)
+					nodes = append(nodes, node)
+				}
+			}
+			opts := defaultOptions
+			opts.MaxNodesTotal = tc.maxNodes
+			processors, templates := processorstest.NewTestProcessors(opts)
+			listers := kube_util.NewListerRegistry(nil, nil, kube_util.NewTestPodLister(nil), nil, nil, nil, nil, nil, nil)
+			ac, err := NewScaleTestAutoscalingContext(opts, fake.NewSimpleClientset(), listers, provider, nil, nil, templates)
+			require.NoError(t, err)
+			require.NoError(t, ac.ClusterSnapshot.SetClusterState(t.Context(), nodes, nil, nil, nil))
+			require.NoError(t, templates.Recompute(t.Context(), &ac, nodes, nil, taints.TaintConfig{}, time.Now()))
+			csr := clusterstate.NewClusterStateRegistry(provider, ac.LogRecorder, NewBackoff(), nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 15 * time.Minute}), templates, clusterstate.WithScaleStateNotifier(processors.ScaleStateNotifier))
+			require.NoError(t, csr.UpdateNodes(t.Context(), nodes, time.Now()))
+			factory := resourcequotas.NewTrackerFactory(resourcequotas.TrackerOptions{QuotaProvider: resourcequotas.NewCloudQuotasProvider(provider), CustomResourcesProcessor: processors.CustomResourcesProcessor})
+			orchestrator := New()
+			orchestrator.Initialize(&ac, processors, csr, newEstimatorBuilder(), taints.TaintConfig{}, factory)
+			result, err := orchestrator.ScaleUpToNodeGroupMinSize(t.Context(), nodes, templates.GetNodeInfos())
+			require.NoError(t, err)
+			require.Equal(t, tc.wantIncrease, totalIncrease)
+			if tc.wantIncrease == 0 {
+				require.Equal(t, status.ScaleUpNotNeeded, result.Result)
+			} else {
+				require.True(t, result.WasSuccessful())
+			}
+			for _, info := range result.ScaleUpInfos {
+				require.Greater(t, info.NewSize, info.CurrentSize)
+			}
+		})
+	}
 }
