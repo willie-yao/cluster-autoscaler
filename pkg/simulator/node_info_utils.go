@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/daemonset"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
+	kube_util "sigs.k8s.io/cluster-autoscaler/pkg/utils/kubernetes"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/labels"
 	podutils "sigs.k8s.io/cluster-autoscaler/pkg/utils/pod"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/taints"
@@ -71,6 +73,11 @@ func SanitizedTemplateNodeInfoFromNodeInfo(ctx context.Context, example *framewo
 	if err != nil {
 		return nil, errors.ToAutoscalerError(errors.InternalError, err)
 	}
+	// A new node from the group isn't suspended, even if the example is.
+	node := sanitizedExample.Node()
+	node.Status.Conditions = slices.DeleteFunc(node.Status.Conditions, func(condition apiv1.NodeCondition) bool {
+		return condition.Type == kube_util.NodeSuspended
+	})
 	expectedPods, err := podsExpectedOnFreshNode(sanitizedExample, daemonsets, forceDaemonSets, randSuffix)
 	if err != nil {
 		return nil, errors.ToAutoscalerError(errors.InternalError, err)

@@ -53,7 +53,7 @@ const (
 	// messageTrancated is displayed at the end of a trancated message.
 	messageTrancated = "<truncated>"
 	// suspendedNodeCondition is the node condition type for suspended nodes.
-	suspendedNodeCondition = "Suspended"
+	suspendedNodeCondition = kube_util.NodeSuspended
 )
 
 var (
@@ -725,12 +725,7 @@ type Readiness struct {
 }
 
 func isSuspendedNode(node *apiv1.Node) bool {
-	for _, condition := range node.Status.Conditions {
-		if condition.Type == suspendedNodeCondition {
-			return condition.Status == apiv1.ConditionTrue
-		}
-	}
-	return false
+	return kube_util.IsNodeSuspended(node)
 }
 
 // isResumingNode returns true if the node's "Suspended" condition turned False within maxNodeStartupTime.

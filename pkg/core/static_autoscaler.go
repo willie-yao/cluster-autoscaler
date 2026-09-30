@@ -560,6 +560,7 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 		for i, nodeInfo := range allNodeInfos {
 			nodes[i] = nodeInfo.Node()
 		}
+		nodes = withoutSuspendedNodes(nodes)
 
 		if a.AutoscalingContext.AutoscalingOptions.SalvoScaleUp {
 			scaleUpStatus, typedErr = a.runScaleUpSalvo(ctx, currentTime,
@@ -595,6 +596,7 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 		for i, nodeInfo := range allNodeInfos {
 			nodes[i] = nodeInfo.Node()
 		}
+		nodes = withoutSuspendedNodes(nodes)
 
 		scaleUpFn := func() (*status.ScaleUpStatus, caerrors.AutoscalerError) {
 			return a.scaleUpOrchestrator.ScaleUpToNodeGroupMinSize(ctx, nodes, templateNodeInfos)
@@ -605,9 +607,23 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 	return nil
 }
 
+// withoutSuspendedNodes returns the nodes that count against the cluster-wide
+// node and resource limits of a scale-up. Suspended nodes are left out,
+// because their VMs are stopped. Resuming nodes still count.
+func withoutSuspendedNodes(nodes []*apiv1.Node) []*apiv1.Node {
+	result := make([]*apiv1.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if !kube_util.IsNodeSuspended(node) {
+			result = append(result, node)
+		}
+	}
+	return result
+}
+
 func (a *StaticAutoscaler) shouldScaleUp(ctx context.Context, unschedulablePodsToHelp []*apiv1.Pod, scaleUpStatus *status.ScaleUpStatus, readyNodes []*apiv1.Node, currentTime time.Time) (bool, *status.ScaleUpStatus) {
 	logger := klog.FromContext(ctx)
 	shouldScaleUp := true
+	readyNodes = withoutSuspendedNodes(readyNodes)
 	if len(unschedulablePodsToHelp) == 0 {
 		scaleUpStatus.Result = status.ScaleUpNotNeeded
 		logger.V(1).Info("No unschedulable pods")
