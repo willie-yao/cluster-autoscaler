@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	mock_cloudprovider "sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/mocks"
 	caerrors "sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
+	kube_util "sigs.k8s.io/cluster-autoscaler/pkg/utils/kubernetes"
 )
 
 func TestGetNodeResource(t *testing.T) {
@@ -145,6 +146,29 @@ func TestVirtualKubeletNodeFilter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := VirtualKubeletNodeFilter{}
 			assert.Equalf(t, tt.want, f.ExcludeFromTracking(tt.args.node), "VirtualKubeletNodeFilter.ExcludeFromTracking(%v)", tt.args.node)
+		})
+	}
+}
+
+func TestSuspendedNodeFilter(t *testing.T) {
+	suspended := func(status apiv1.ConditionStatus) *apiv1.Node {
+		node := BuildTestNode("n1", 1000, MiB)
+		SetNodeCondition(node, kube_util.NodeSuspended, status, time.Now())
+		return node
+	}
+	tests := []struct {
+		name string
+		node *apiv1.Node
+		want bool
+	}{
+		{name: "nil node", node: nil, want: false},
+		{name: "no Suspended condition", node: BuildTestNode("n1", 1000, MiB), want: false},
+		{name: "resuming node", node: suspended(apiv1.ConditionFalse), want: false},
+		{name: "suspended node", node: suspended(apiv1.ConditionTrue), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, SuspendedNodeFilter{}.ExcludeFromTracking(tt.node))
 		})
 	}
 }

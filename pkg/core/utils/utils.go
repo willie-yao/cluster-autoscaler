@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/cluster-autoscaler/pkg/metrics"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
+	kube_util "sigs.k8s.io/cluster-autoscaler/pkg/utils/kubernetes"
 )
 
 const (
@@ -48,6 +49,14 @@ type VirtualKubeletNodeFilter struct{}
 // ExcludeFromTracking returns true if the node is created by virtual kubelet.
 func (f VirtualKubeletNodeFilter) ExcludeFromTracking(node *apiv1.Node) bool {
 	return isVirtualKubeletNode(node)
+}
+
+// SuspendedNodeFilter excludes suspended nodes from quota tracking.
+type SuspendedNodeFilter struct{}
+
+// ExcludeFromTracking returns true if the node has the condition "Suspended=True".
+func (f SuspendedNodeFilter) ExcludeFromTracking(node *apiv1.Node) bool {
+	return node != nil && kube_util.IsNodeSuspended(node)
 }
 
 // FilterOutNodesFromNotAutoscaledGroups return subset of input nodes for which cloud provider does not

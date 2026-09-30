@@ -242,3 +242,43 @@ func TestScaleUp_ResourceLimitsWithSuspendedNodes(t *testing.T) {
 		})
 	}
 }
+
+// TestScaleDown_MinCoresWithSuspendedNodes records how the minimum cores limit
+// treats suspended Nodes. It doesn't define the intended behavior.
+func TestScaleDown_MinCoresWithSuspendedNodes(t *testing.T) {
+	options := integration.NewTestConfig().WithOverrides(integration.WithScaleDownUnneededTime(time.Minute)).ResolveOptions()
+	infra := integration.SetupInfrastructure(t)
+	fakes := infra.Fakes
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer synctestutils.TearDown(cancel)
+
+		autoscaler, _, err := integration.DefaultAutoscalingBuilder(options, infra).Build(ctx)
+		require.NoError(t, err)
+		template := test.BuildTestNode("ng-template", 1000, units.GiB, test.IsReady(true))
+		fakes.CloudProvider.AddNodeGroup("ng", testprovider.WithNodes(template, 2))
+		// Park the second Node the way a provider that suspends VMs does.
+		for _, node := range fakes.K8s.Nodes().Items {
+			if node.Name == "ng-node-1" {
+				test.SetNodeReadyState(&node, false, time.Now())
+				test.SetNodeCondition(&node, kube_util.NodeSuspended, apiv1.ConditionTrue, time.Now())
+				node.Annotations = map[string]string{"cluster-autoscaler.kubernetes.io/scale-down-disabled": "true"}
+				fakes.K8s.UpdateNode(&node)
+			}
+		}
+		// The empty active Node is unneeded. With the suspended Node, the
+		// cluster has 2 cores, one above the minimum.
+		fakes.CloudProvider.SetResourceLimit(cloudprovider.ResourceNameCores, 1, 1000)
+
+		synctestutils.MustRunOnceAfter(t, autoscaler, suspendedTestStep)
+		synctestutils.MustRunOnceAfter(t, autoscaler, time.Minute+time.Nanosecond)
+		synctestutils.MustRunOnceAfter(t, autoscaler, suspendedTestStep)
+
+		// The suspended Node doesn't count toward the minimum, so the active
+		// Node is kept.
+		size, _ := fakes.CloudProvider.GetNodeGroup("ng").TargetSize(ctx)
+		assert.Equal(t, 2, size)
+		assert.Len(t, fakes.K8s.Nodes().Items, 2)
+	})
+}

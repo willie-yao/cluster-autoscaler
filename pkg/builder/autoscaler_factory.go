@@ -148,7 +148,8 @@ func initializeDefaultOptions(ctx context.Context, opts *coreoptions.AutoscalerO
 	}
 	if opts.QuotasTrackerOptions.NodeFilter == nil {
 		virtualKubeletNodeFilter := utils.VirtualKubeletNodeFilter{}
-		opts.QuotasTrackerOptions.NodeFilter = resourcequotas.NewCombinedNodeFilter([]resourcequotas.NodeFilter{virtualKubeletNodeFilter})
+		suspendedNodeFilter := utils.SuspendedNodeFilter{}
+		opts.QuotasTrackerOptions.NodeFilter = resourcequotas.NewCombinedNodeFilter([]resourcequotas.NodeFilter{virtualKubeletNodeFilter, suspendedNodeFilter})
 	}
 
 	if opts.MinQuotasTrackerOptions.QuotaProvider == nil {
