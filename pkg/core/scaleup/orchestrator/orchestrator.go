@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/cluster-autoscaler/pkg/resourcequotas"
 	"sigs.k8s.io/cluster-autoscaler/pkg/simulator"
 	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/annotations"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/klogx"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/taints"
@@ -236,6 +237,25 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 	now := time.Now()
 	nodeGroups := o.autoscalingCtx.CloudProvider.NodeGroups(ctx)
 	scaleUpInfos := make(nodegroupset.ScaleUpInfos, 0)
+	currentNodeCount := len(nodes)
+	if o.autoscalingCtx.MaxNodesTotal > 0 {
+		// Count current upcoming nodes once, including requests made earlier in the loop.
+		o.clusterStateRegistry.Recalculate(ctx)
+		upcomingCounts, registeredUpcomingNames := o.clusterStateRegistry.GetUpcomingNodes(ctx)
+		registeredUpcoming := sets.New[string]()
+		for _, names := range registeredUpcomingNames {
+			registeredUpcoming.Insert(names...)
+		}
+		for _, node := range nodes {
+			if node.Annotations[annotations.NodeUpcomingAnnotation] == "true" || registeredUpcoming.Has(node.Name) {
+				currentNodeCount--
+			}
+		}
+		for _, count := range upcomingCounts {
+			currentNodeCount += count
+		}
+		currentNodeCount = max(currentNodeCount, len(nodes))
+	}
 
 	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, nodes)
 	if err != nil {
@@ -283,7 +303,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 		}
 		newNodeCount = checkResult.AllowedDelta
 
-		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, targetSize)
+		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, currentNodeCount)
 		if err != nil {
 			logger.Info("ScaleUpToNodeGroupMinSize: failed to get capped node count", "err", err)
 			continue
@@ -296,6 +316,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 			MaxSize:     ng.MaxSize(ctx),
 		}
 		scaleUpInfos = append(scaleUpInfos, info)
+		currentNodeCount += newNodeCount
 	}
 
 	if len(scaleUpInfos) == 0 {
