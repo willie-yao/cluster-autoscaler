@@ -41,6 +41,7 @@ import (
 	drautils "sigs.k8s.io/cluster-autoscaler/pkg/simulator/dynamicresources/utils"
 	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
+	kube_util "sigs.k8s.io/cluster-autoscaler/pkg/utils/kubernetes"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/labels"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/taints"
 	. "sigs.k8s.io/cluster-autoscaler/pkg/utils/test"
@@ -387,6 +388,25 @@ func TestSanitizedTemplateNodeInfoFromNodeInfo(t *testing.T) {
 				t.Fatalf("TemplateNodeInfoFromExampleNodeInfo(): NodeInfo wasn't properly sanitized: %v", err)
 			}
 		})
+	}
+}
+
+func TestSanitizedTemplateNodeInfoFromSuspendedNode(t *testing.T) {
+	node := BuildTestNode("suspended", 1000, 1000, IsReady(true))
+	expectedConditions := append([]apiv1.NodeCondition{}, node.Status.Conditions...)
+	SetNodeCondition(node, kube_util.NodeSuspended, apiv1.ConditionTrue, time.Now())
+	original := node.DeepCopy()
+	template, err := SanitizedTemplateNodeInfoFromNodeInfo(
+		context.Background(), framework.NewNodeInfo(node, nil), "ng", nil, false, taints.TaintConfig{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(expectedConditions, template.Node().Status.Conditions); diff != "" {
+		t.Errorf("unexpected template conditions (-want, +got): %s", diff)
+	}
+	if diff := cmp.Diff(original, node); diff != "" {
+		t.Errorf("source node changed (-want, +got): %s", diff)
 	}
 }
 

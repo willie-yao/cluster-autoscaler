@@ -41,6 +41,19 @@ const (
 	StartupNodes NodeNotReadyReason = "cluster-autoscaler.kubernetes.io/startup-taint"
 )
 
+// NodeSuspended is the type of the node condition that marks a suspended node.
+const NodeSuspended apiv1.NodeConditionType = "Suspended"
+
+// IsNodeSuspended returns true if the node has the condition "Suspended=True".
+func IsNodeSuspended(node *apiv1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == NodeSuspended {
+			return condition.Status == apiv1.ConditionTrue
+		}
+	}
+	return false
+}
+
 // IsNodeReadyAndSchedulable returns true if the node is ready and schedulable.
 func IsNodeReadyAndSchedulable(node *apiv1.Node) bool {
 	ready, _, _ := GetReadinessState(node)
