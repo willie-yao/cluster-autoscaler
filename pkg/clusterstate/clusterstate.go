@@ -709,7 +709,7 @@ type Readiness struct {
 	// Names of nodes that are being currently deleted. They exist in K8S but
 	// are not included in NodeGroup.TargetSize().
 	Deleted []string
-	// Names of nodes that are not yet fully started.
+	// Names of nodes that are not yet fully started, including recently resumed nodes.
 	NotStarted []string
 	// Names of suspended nodes, identified by node condition "Suspended=True".
 	Suspended []string
@@ -736,6 +736,16 @@ func isSuspendedNode(node *apiv1.Node) bool {
 	return false
 }
 
+// isResumingNode returns true if the node's "Suspended" condition turned False within maxNodeStartupTime.
+func isResumingNode(node *apiv1.Node, currentTime time.Time, maxNodeStartupTime time.Duration) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == suspendedNodeCondition {
+			return condition.Status == apiv1.ConditionFalse && condition.LastTransitionTime.Add(maxNodeStartupTime).After(currentTime)
+		}
+	}
+	return false
+}
+
 func (csr *ClusterStateRegistry) updateReadinessStats(ctx context.Context, currentTime time.Time) {
 	logger := klog.FromContext(ctx)
 	perNodeGroup := make(map[string]Readiness)
@@ -756,7 +766,7 @@ func (csr *ClusterStateRegistry) updateReadinessStats(ctx context.Context, curre
 			current.Suspended = append(current.Suspended, node.Name)
 		} else if nr.Ready {
 			current.Ready = append(current.Ready, node.Name)
-		} else if node.CreationTimestamp.Time.Add(maxNodeStartupTime).After(currentTime) {
+		} else if node.CreationTimestamp.Time.Add(maxNodeStartupTime).After(currentTime) || isResumingNode(node, currentTime, maxNodeStartupTime) {
 			current.NotStarted = append(current.NotStarted, node.Name)
 		} else {
 			current.Unready = append(current.Unready, node.Name)

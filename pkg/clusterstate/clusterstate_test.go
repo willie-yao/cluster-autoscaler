@@ -2224,6 +2224,117 @@ func TestIsSuspendedNode(t *testing.T) {
 	}
 }
 
+func TestResumedNodeReadiness(t *testing.T) {
+	now := time.Now()
+
+	testCases := []struct {
+		name              string
+		ready             bool
+		suspendedStatus   apiv1.ConditionStatus
+		lastTransitionAgo time.Duration
+		expected          Readiness
+	}{
+		{
+			name:              "recently resumed node is not started",
+			suspendedStatus:   apiv1.ConditionFalse,
+			lastTransitionAgo: 5 * time.Minute,
+			expected:          Readiness{Registered: []string{"ng1-1"}, NotStarted: []string{"ng1-1"}, Time: now},
+		},
+		{
+			name:              "node resumed longer ago than max node startup time is unready",
+			suspendedStatus:   apiv1.ConditionFalse,
+			lastTransitionAgo: 20 * time.Minute,
+			expected:          Readiness{Registered: []string{"ng1-1"}, Unready: []string{"ng1-1"}, Time: now},
+		},
+		{
+			name:              "resume startup timeout has elapsed",
+			suspendedStatus:   apiv1.ConditionFalse,
+			lastTransitionAgo: 15 * time.Minute,
+			expected:          Readiness{Registered: []string{"ng1-1"}, Unready: []string{"ng1-1"}, Time: now},
+		},
+		{
+			name:              "suspended node is suspended",
+			suspendedStatus:   apiv1.ConditionTrue,
+			lastTransitionAgo: 5 * time.Minute,
+			expected:          Readiness{Registered: []string{"ng1-1"}, Suspended: []string{"ng1-1"}, Time: now},
+		},
+		{
+			name:              "ready resumed node is ready",
+			ready:             true,
+			suspendedStatus:   apiv1.ConditionFalse,
+			lastTransitionAgo: 5 * time.Minute,
+			expected:          Readiness{Registered: []string{"ng1-1"}, Ready: []string{"ng1-1"}, Time: now},
+		},
+		{
+			name:     "node without suspended condition is unready",
+			expected: Readiness{Registered: []string{"ng1-1"}, Unready: []string{"ng1-1"}, Time: now},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ng1_1 := BuildTestNode("ng1-1", 1000, 1000)
+			ng1_1.CreationTimestamp = metav1.Time{Time: now.Add(-24 * time.Hour)}
+			SetNodeReadyState(ng1_1, tc.ready, now.Add(-time.Minute))
+			if tc.suspendedStatus != "" {
+				SetNodeCondition(ng1_1, apiv1.NodeConditionType(suspendedNodeCondition), tc.suspendedStatus, now.Add(-tc.lastTransitionAgo))
+			}
+
+			provider := testprovider.NewTestCloudProviderBuilder().Build()
+			provider.AddNodeGroup("ng1", 1, 10, 1)
+			provider.AddNode("ng1", ng1_1)
+
+			fakeClient := &fake.Clientset{}
+			fakeLogRecorder, _ := utils.NewStatusMapRecorder(fakeClient, "kube-system", kube_record.NewFakeRecorder(5), false, "some-map")
+			clusterstate := NewClusterStateRegistry(provider, fakeLogRecorder, newBackoff(), nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 15 * time.Minute, MaxNodeStartupTime: 15 * time.Minute}), &emptyTemplateNodeInfoRegistry{},
+				WithConfig(ClusterStateRegistryConfig{MaxTotalUnreadyPercentage: 10, OkTotalUnreadyCount: 1}))
+
+			err := clusterstate.UpdateNodes(context.Background(), []*apiv1.Node{ng1_1}, now)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, clusterstate.GetClusterReadiness())
+		})
+	}
+}
+
+func TestUpcomingNodesAfterResume(t *testing.T) {
+	now := time.Now()
+
+	ng1_1 := BuildTestNode("ng1-1", 1000, 1000)
+	SetNodeReadyState(ng1_1, true, now.Add(-time.Minute))
+	ng1_2 := BuildTestNode("ng1-2", 1000, 1000)
+	SetNodeReadyState(ng1_2, false, now.Add(-time.Hour))
+	SetNodeCondition(ng1_2, apiv1.NodeConditionType(suspendedNodeCondition), apiv1.ConditionTrue, now.Add(-time.Hour))
+	// ng1-3 was suspended and has just been resumed, but isn't Ready yet.
+	ng1_3 := BuildTestNode("ng1-3", 1000, 1000)
+	SetNodeReadyState(ng1_3, false, now.Add(-time.Hour))
+	SetNodeCondition(ng1_3, apiv1.NodeConditionType(suspendedNodeCondition), apiv1.ConditionFalse, now.Add(-time.Minute))
+	for _, node := range []*apiv1.Node{ng1_1, ng1_2, ng1_3} {
+		node.CreationTimestamp = metav1.Time{Time: now.Add(-24 * time.Hour)}
+	}
+
+	// Target size includes suspended nodes, so resuming ng1-3 doesn't change it.
+	provider := testprovider.NewTestCloudProviderBuilder().Build()
+	provider.AddNodeGroup("ng1", 1, 10, 3)
+	provider.AddNode("ng1", ng1_1)
+	provider.AddNode("ng1", ng1_2)
+	provider.AddNode("ng1", ng1_3)
+
+	fakeClient := &fake.Clientset{}
+	fakeLogRecorder, _ := utils.NewStatusMapRecorder(fakeClient, "kube-system", kube_record.NewFakeRecorder(5), false, "some-map")
+	clusterstate := NewClusterStateRegistry(provider, fakeLogRecorder, newBackoff(), nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 15 * time.Minute, MaxNodeStartupTime: 15 * time.Minute}), &emptyTemplateNodeInfoRegistry{},
+		WithConfig(ClusterStateRegistryConfig{MaxTotalUnreadyPercentage: 10, OkTotalUnreadyCount: 1}))
+
+	clusterstate.RegisterScaleUp(context.Background(), provider.GetNodeGroup("ng1"), 1, now.Add(-time.Minute))
+	err := clusterstate.UpdateNodes(context.Background(), []*apiv1.Node{ng1_1, ng1_2, ng1_3}, now)
+	assert.NoError(t, err)
+	assert.True(t, clusterstate.IsNodeGroupScalingUp(context.Background(), "ng1"))
+
+	// Target is 3, 1 Ready + 1 Suspended = 2. Upcoming should be 1.
+	upcomingNodes, upcomingRegistered := clusterstate.GetUpcomingNodes(context.Background())
+	assert.Equal(t, 1, upcomingNodes["ng1"])
+	assert.Equal(t, []string{"ng1-3"}, upcomingRegistered["ng1"])
+}
+
 func TestExpiredScaleUpRevertsTargetSize(t *testing.T) {
 	now := time.Now()
 
