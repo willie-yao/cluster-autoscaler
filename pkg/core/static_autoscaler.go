@@ -70,6 +70,7 @@ import (
 
 	v1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -306,6 +307,14 @@ func (a *StaticAutoscaler) initializeRemainingPdbTracker(ctx context.Context) ca
 // RunOnce iterates over node groups and scales them up/down if necessary
 func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) caerrors.AutoscalerError {
 	logger := klog.FromContext(ctx)
+	// Informer caches can serve stale data while the API server is unavailable.
+	// Check API access before using cached data to make scaling decisions.
+	// Limit the response to one node; an empty list is also valid.
+	if _, err := a.ClientSet.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1}); err != nil {
+		logger.Error(err, "Failed to list nodes from API server, skipping iteration")
+		return caerrors.ToAutoscalerError(caerrors.ApiCallError, err)
+	}
+
 	a.cleanUpIfRequired(ctx)
 	a.processorCallbacks.reset()
 	a.DebuggingSnapshotter.StartDataCollection(ctx)

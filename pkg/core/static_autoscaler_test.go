@@ -39,11 +39,15 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	v1appslister "k8s.io/client-go/listers/apps/v1"
+	k8s_testing "k8s.io/client-go/testing"
 	kube_record "k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
@@ -361,6 +365,129 @@ func setupAutoscaler(config *autoscalerSetupConfig) (*StaticAutoscaler, error) {
 	}
 
 	return autoscaler, nil
+}
+
+func TestStaticAutoscalerRunOnceAPIServerCheck(t *testing.T) {
+	for _, writeStatusConfigMap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("writeStatusConfigMap=%v", writeStatusConfigMap), func(t *testing.T) {
+			for _, tc := range []struct {
+				name  string
+				nodes []apiv1.Node
+				err   error
+			}{
+				{name: "empty cluster"},
+				{name: "nonempty cluster", nodes: []apiv1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}}},
+				{name: "connection failure", err: fmt.Errorf("connection refused")},
+				{name: "timeout", err: context.DeadlineExceeded},
+				{name: "unavailable", err: apierrors.NewServiceUnavailable("API server unavailable")},
+				{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "", fmt.Errorf("access denied"))},
+				{name: "not found", err: apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, "")},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					autoscaler, err := setupAutoscaler(&autoscalerSetupConfig{
+						mocks: newCommonMocks(),
+						autoscalingOptions: config.AutoscalingOptions{
+							WriteStatusConfigMap: writeStatusConfigMap,
+							ConfigNamespace:      "custom-namespace",
+							StatusConfigMapName:  "custom-status",
+						},
+					})
+					if !assert.NoError(t, err) {
+						return
+					}
+					client := fake.NewSimpleClientset()
+					calls := 0
+					client.PrependReactor("list", "nodes", func(action k8s_testing.Action) (bool, runtime.Object, error) {
+						calls++
+						assert.Equal(t, metav1.ListOptions{Limit: 1}, action.(k8s_testing.ListActionImpl).GetListOptions())
+						return true, &apiv1.NodeList{Items: tc.nodes}, tc.err
+					})
+					autoscaler.ClientSet = client
+
+					runErr := autoscaler.RunOnce(t.Context(), time.Now())
+					assert.Equal(t, 1, calls)
+					if tc.err != nil {
+						if assert.Error(t, runErr) {
+							assert.Equal(t, errors.ApiCallError, runErr.Type())
+							assert.ErrorIs(t, runErr, tc.err)
+						}
+						assert.False(t, autoscaler.initialized)
+						assert.Len(t, client.Actions(), 1)
+					} else {
+						assert.NoError(t, runErr)
+						assert.True(t, autoscaler.initialized)
+						if !writeStatusConfigMap {
+							assert.Len(t, client.Actions(), 1)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestStaticAutoscalerRunOnceAPIServerUnavailableSkipsUnregisteredNodeDeletion(t *testing.T) {
+	now := time.Now()
+	node := BuildTestNode("n1", 1000, 1000)
+	mocks := newCommonMocks()
+	deleted := make(chan bool, 1)
+	autoscaler, err := setupAutoscaler(&autoscalerSetupConfig{
+		nodeGroups: []*nodeGroup{{
+			name: "ng1", nodes: []*apiv1.Node{node}, min: 0, max: 10,
+			template: framework.NewTestNodeInfo(node),
+		}},
+		nodeStateUpdateTime: now,
+		mocks:               mocks,
+		nodesDeleted:        deleted,
+		autoscalingOptions: config.AutoscalingOptions{
+			ScaleUpFromZero: true,
+			NodeGroupDefaults: config.NodeGroupAutoscalingOptions{
+				MaxNodeProvisionTime: time.Minute,
+			},
+		},
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.NoError(t, autoscaler.clusterStateRegistry.UpdateNodes(t.Context(), nil, now))
+	unregistered := autoscaler.clusterStateRegistry.GetUnregisteredNodes()
+	assert.Len(t, unregistered, 1)
+	client := fake.NewSimpleClientset()
+	unavailable := true
+	client.PrependReactor("list", "nodes", func(k8s_testing.Action) (bool, runtime.Object, error) {
+		if unavailable {
+			return true, nil, apierrors.NewServiceUnavailable("API server unavailable")
+		}
+		return true, &apiv1.NodeList{}, nil
+	})
+	autoscaler.ClientSet = client
+
+	runErr := autoscaler.RunOnce(t.Context(), now.Add(2*time.Minute))
+	if assert.Error(t, runErr) {
+		assert.Equal(t, errors.ApiCallError, runErr.Type())
+	}
+	assert.Equal(t, unregistered, autoscaler.clusterStateRegistry.GetUnregisteredNodes())
+	assert.Empty(t, deleted)
+	assert.False(t, autoscaler.initialized)
+
+	unavailable = false
+	mocks.allPodLister.On("List").Return([]*apiv1.Pod{}, nil).Once()
+	mocks.daemonSetLister.On("List", labels.Everything()).Return([]*appsv1.DaemonSet{}, nil).Once()
+	mocks.podDisruptionBudgetLister.On("List").Return([]*policyv1.PodDisruptionBudget{}, nil).Once()
+	mocks.onScaleDown.On("ScaleDown", "ng1", "n1").Return(nil).Once()
+
+	assert.NoError(t, autoscaler.RunOnce(t.Context(), now.Add(3*time.Minute)))
+	assert.Len(t, deleted, 1)
+	assert.True(t, autoscaler.initialized)
+
+	unavailable = true
+	runErr = autoscaler.RunOnce(t.Context(), now.Add(4*time.Minute))
+	if assert.Error(t, runErr) {
+		assert.Equal(t, errors.ApiCallError, runErr.Type())
+	}
+	assert.Len(t, deleted, 1)
+	mock.AssertExpectationsForObjects(t, mocks.allPodLister, mocks.daemonSetLister,
+		mocks.podDisruptionBudgetLister, mocks.onScaleUp, mocks.onScaleDown)
 }
 
 // TODO: Refactor tests to use setupAutoscaler
