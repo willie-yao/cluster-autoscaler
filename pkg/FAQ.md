@@ -50,6 +50,7 @@ this document:
   * [Does CA work with PodDisruptionBudget in scale-down?](#does-ca-work-with-poddisruptionbudget-in-scale-down)
   * [Does CA respect GracefulTermination in scale-down?](#does-ca-respect-gracefultermination-in-scale-down)
   * [How does CA deal with unready nodes?](#how-does-ca-deal-with-unready-nodes)
+  * [How does CA treat suspended nodes?](#how-does-ca-treat-suspended-nodes)
   * [How fast is Cluster Autoscaler?](#how-fast-is-cluster-autoscaler)
   * [How fast is HPA when combined with CA?](#how-fast-is-hpa-when-combined-with-ca)
   * [Where can I find the designs of the upcoming features?](#where-can-i-find-the-designs-of-the-upcoming-features)
@@ -896,6 +897,14 @@ Once there are more unready nodes in the cluster,
 CA stops all operations until the situation improves. If there are fewer unready nodes,
 but they are concentrated in a particular node group,
 then this node group may be excluded from future scale-ups.
+
+### How does CA treat suspended nodes?
+
+CA recognizes nodes whose provider sets `Suspended=True`. The core does not stop or start VMs or set the condition. The provider owns the lifecycle and includes suspended VMs in its node group target size.
+
+After the provider sets `Suspended=False`, an unready node counts as starting until `--max-node-startup-time` has elapsed since the condition's transition time. A ready node counts as ready immediately.
+
+If `node.cloudprovider.kubernetes.io/shutdown` or `node.kubernetes.io/out-of-service` remains temporarily during resume, add the relevant taint keys with `--startup-taint` so they do not block scheduling simulations until the cloud controller removes them.
 
 ### How fast is Cluster Autoscaler?
 
