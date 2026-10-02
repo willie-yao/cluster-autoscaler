@@ -349,7 +349,9 @@ func (csr *ClusterStateRegistry) updateScaleRequests(ctx context.Context, curren
 		if csr.asyncNodeGroupStateChecker.IsUpcoming(scaleUpRequest.NodeGroup) {
 			continue
 		}
-		if !csr.areThereUpcomingNodesInNodeGroup(ctx, nodeGroupName) {
+		upcoming, ok := csr.getUpcomingNodesInNodeGroup(ctx, nodeGroupName)
+		// Long-unregistered nodes are not upcoming, but cannot fulfill a scale-up request.
+		if !ok || upcoming+len(csr.perNodeGroupReadiness[nodeGroupName].LongUnregistered) <= 0 {
 			// scale up finished successfully, remove request
 			delete(csr.scaleUpRequests, nodeGroupName)
 			logger.V(4).Info("Scale up in group finished successfully", "nodeGroupName", nodeGroupName, "duration", currentTime.Sub(scaleUpRequest.Time))

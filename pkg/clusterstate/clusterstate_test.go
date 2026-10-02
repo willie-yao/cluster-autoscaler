@@ -617,6 +617,112 @@ func TestExpiredScaleUp(t *testing.T) {
 	})
 }
 
+func TestLongUnregisteredScaleUpBacksOff(t *testing.T) {
+	ctx := context.Background()
+	start := time.Now()
+	ready := BuildTestNode("ng1-1", 1000, 1000)
+	SetNodeReadyState(ready, true, start.Add(-time.Hour))
+	neverRegisters := BuildTestNode("ng1-2", 1000, 1000)
+	provider := testprovider.NewTestCloudProviderBuilder().
+		WithOnScaleUp(func(string, int) error { return nil }).
+		Build()
+	provider.AddNodeGroup("ng1", 1, 10, 2)
+	provider.AddNode("ng1", ready)
+	provider.AddNode("ng1", neverRegisters)
+	ng := provider.GetNodeGroup("ng1")
+	fakeRecorder := kube_record.NewFakeRecorder(10)
+	logRecorder, err := utils.NewStatusMapRecorder(fake.NewSimpleClientset(), "kube-system", fakeRecorder, true, "status")
+	assert.NoError(t, err)
+	csr := NewNotifiedClusterStateRegistry(
+		provider,
+		logRecorder,
+		newBackoff(),
+		nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 15 * time.Minute}),
+		newMockTemplateNodeInfoRegistry(map[string]*framework.NodeInfo{"ng1": framework.NewTestNodeInfo(ready)}),
+	)
+
+	csr.RegisterScaleUp(ctx, ng, 1, start)
+	firstSeen := start.Add(time.Second)
+	assert.NoError(t, csr.UpdateNodes(ctx, []*apiv1.Node{ready}, firstSeen))
+	assert.True(t, csr.HasNodeGroupStartedScaleUp("ng1"))
+	assert.False(t, csr.BackoffStatusForNodeGroup(ctx, ng, firstSeen).IsBackedOff)
+
+	// Both the request and the unregistered instance expire between loops.
+	now := firstSeen.Add(15*time.Minute + 100*time.Millisecond)
+	assert.NoError(t, csr.UpdateNodes(ctx, []*apiv1.Node{ready}, now))
+	backoffStatus := csr.BackoffStatusForNodeGroup(ctx, ng, now)
+	assert.True(t, backoffStatus.IsBackedOff)
+	assert.Equal(t, string(metrics.Timeout), backoffStatus.ErrorInfo.ErrorCode)
+	assert.False(t, csr.HasNodeGroupStartedScaleUp("ng1"))
+	upcoming, _ := csr.GetUpcomingNodes(ctx)
+	assert.NotContains(t, upcoming, "ng1")
+	select {
+	case event := <-fakeRecorder.Events:
+		assert.Equal(t, "Warning ScaleUpTimedOut Nodes added to group ng1 failed to register within 15m1.1s", event)
+	default:
+		t.Error("Expected ScaleUpTimedOut event")
+	}
+}
+
+func TestScaleUpCompletionWithDeletedNodes(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		hasInstanceNotImplemented bool
+	}{
+		{name: "HasInstance implemented"},
+		{name: "HasInstance not implemented", hasInstanceNotImplemented: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			start := time.Now()
+			ready := BuildTestNode("ng1-1", 1000, 1000)
+			SetNodeReadyState(ready, true, start.Add(-time.Hour))
+			deleted := BuildTestNode("ng1-2", 1000, 1000)
+			SetNodeReadyState(deleted, true, start.Add(-time.Hour))
+			deleted.Spec.Taints = []apiv1.Taint{{Key: taints.ToBeDeletedTaint, Effect: apiv1.TaintEffectNoSchedule}}
+			provider := testprovider.NewTestCloudProviderBuilder().
+				WithHasInstance(func(name string) (bool, error) {
+					if tc.hasInstanceNotImplemented {
+						return false, cloudprovider.ErrNotImplemented
+					}
+					return name != deleted.Name, nil
+				}).
+				WithOnScaleUp(func(string, int) error { return nil }).
+				Build()
+			provider.AddNodeGroup("ng1", 1, 10, 2)
+			provider.AddNode("ng1", ready)
+			provider.AddNode("ng1", deleted)
+			ng := provider.GetNodeGroup("ng1")
+			logRecorder, err := utils.NewStatusMapRecorder(&fake.Clientset{}, "kube-system", kube_record.NewFakeRecorder(10), false, "status")
+			assert.NoError(t, err)
+			csr := NewNotifiedClusterStateRegistry(
+				provider,
+				logRecorder,
+				newBackoff(),
+				nodegroupconfig.NewDefaultNodeGroupConfigProcessor(config.NodeGroupAutoscalingOptions{MaxNodeProvisionTime: 15 * time.Minute}),
+				newMockTemplateNodeInfoRegistry(map[string]*framework.NodeInfo{"ng1": framework.NewTestNodeInfo(ready)}),
+			)
+
+			csr.RegisterScaleUp(ctx, ng, 1, start)
+			assert.NoError(t, csr.UpdateNodes(ctx, []*apiv1.Node{ready, deleted}, start.Add(time.Second)))
+			assert.True(t, csr.HasNodeGroupStartedScaleUp("ng1"))
+			upcoming, _ := csr.GetUpcomingNodes(ctx)
+			assert.Equal(t, 1, upcoming["ng1"])
+
+			newNode := BuildTestNode("ng1-3", 1000, 1000)
+			SetNodeReadyState(newNode, true, start.Add(time.Minute))
+			provider.AddNode("ng1", newNode)
+			// A completed scale-up still succeeds when observed after its deadline.
+			now := start.Add(15*time.Minute + time.Second)
+			assert.NoError(t, csr.UpdateNodes(ctx, []*apiv1.Node{ready, deleted, newNode}, now))
+			assert.False(t, csr.HasNodeGroupStartedScaleUp("ng1"))
+			assert.False(t, csr.BackoffStatusForNodeGroup(ctx, ng, now).IsBackedOff)
+			upcoming, _ = csr.GetUpcomingNodes(ctx)
+			assert.NotContains(t, upcoming, "ng1")
+		})
+	}
+}
+
 func TestRegisterScaleDown(t *testing.T) {
 	ng1_1 := BuildTestNode("ng1-1", 1000, 1000)
 	provider := testprovider.NewTestCloudProviderBuilder().Build()
