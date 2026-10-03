@@ -70,6 +70,7 @@ import (
 
 	v1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -82,6 +83,8 @@ const (
 	// The idea is that nodes with GPU are very expensive and we're ready to sacrifice
 	// a bit more latency to wait for more pods and make a more informed scale-up decision.
 	unschedulablePodWithGpuTimeBuffer = 30 * time.Second
+	// Maximum time to list live nodes before removing unregistered nodes.
+	unregisteredNodesListTimeout = 30 * time.Second
 	// Number of autoscaler loops in a graceful degradation cycle.
 	// When autoscaler is unable to handle a large number of pending pods, when attempting to
 	// run scheduling simulations, autoscaler enters to a graceful degradation mode.
@@ -1013,10 +1016,40 @@ func (a *StaticAutoscaler) removeOldUnregisteredNodes(ctx context.Context, allUn
 	if err != nil {
 		return false, err
 	}
+	if len(unregisteredNodesToRemove) == 0 {
+		return false, nil
+	}
+
+	// Confirm registration from a complete live list before deleting any candidates.
+	registeredProviderIDs := make(map[string]struct{})
+	listCtx, cancel := context.WithTimeout(ctx, unregisteredNodesListTimeout)
+	defer cancel()
+	listOptions := metav1.ListOptions{Limit: 500}
+	for {
+		nodes, err := a.ClientSet.CoreV1().Nodes().List(listCtx, listOptions)
+		if err != nil {
+			return false, fmt.Errorf("failed to list nodes before removing unregistered nodes: %w", err)
+		}
+		for _, node := range nodes.Items {
+			registeredProviderIDs[node.Spec.ProviderID] = struct{}{}
+		}
+		listOptions.Continue = nodes.Continue
+		if listOptions.Continue == "" {
+			break
+		}
+	}
+	cancel()
 
 	nodeGroups := a.nodeGroupsById(ctx)
 	removedAny := false
 	for nodeGroupId, unregisteredNodesToDelete := range unregisteredNodesToRemove {
+		unregisteredNodesToDelete = slices.DeleteFunc(unregisteredNodesToDelete, func(node clusterstate.UnregisteredNode) bool {
+			_, registered := registeredProviderIDs[node.Node.Spec.ProviderID]
+			return registered
+		})
+		if len(unregisteredNodesToDelete) == 0 {
+			continue
+		}
 		nodeGroup := nodeGroups[nodeGroupId]
 		logger.V(0).Info("Removing unregistered nodes for node group", "nodesCount", len(unregisteredNodesToDelete), "nodeGroupId", nodeGroupId)
 		if !a.ForceDeleteLongUnregisteredNodes {
