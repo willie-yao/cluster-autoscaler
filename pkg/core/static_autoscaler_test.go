@@ -39,11 +39,14 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	v1appslister "k8s.io/client-go/listers/apps/v1"
+	k8s_testing "k8s.io/client-go/testing"
 	kube_record "k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
@@ -361,6 +364,52 @@ func setupAutoscaler(config *autoscalerSetupConfig) (*StaticAutoscaler, error) {
 	}
 
 	return autoscaler, nil
+}
+
+func TestStaticAutoscalerRunOnceWithStaleNodeCache(t *testing.T) {
+	now := time.Now()
+	known := BuildTestNode("known", 1000, 1000)
+	registered := BuildTestNode("registered-after-disconnect", 1000, 1000)
+	SetNodeReadyState(known, true, now.Add(-time.Hour))
+	SetNodeReadyState(registered, true, now)
+	mocks := newCommonMocks()
+	mocks.allNodeLister.SetNodes([]*apiv1.Node{known})
+	mocks.readyNodeLister.SetNodes([]*apiv1.Node{known})
+	deleted := make(chan bool, 1)
+	autoscaler, err := setupAutoscaler(&autoscalerSetupConfig{
+		nodeGroups: []*nodeGroup{{
+			name: "ng1", nodes: []*apiv1.Node{known, registered}, min: 0, max: 10,
+			template: framework.NewTestNodeInfo(known),
+		}},
+		nodeStateUpdateTime: now,
+		mocks:               mocks,
+		nodesDeleted:        deleted,
+		autoscalingOptions: config.AutoscalingOptions{
+			ScaleUpFromZero: true,
+			NodeGroupDefaults: config.NodeGroupAutoscalingOptions{
+				MaxNodeProvisionTime: time.Minute,
+			},
+		},
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+	autoscaler.initialized = true
+	liveNode := registered.DeepCopy()
+	liveNode.Name = "kubernetes-node-name"
+	autoscaler.ClientSet = fake.NewSimpleClientset(known, liveNode)
+	assert.NoError(t, autoscaler.clusterStateRegistry.UpdateNodes(t.Context(), []*apiv1.Node{known}, now))
+	assert.Len(t, autoscaler.clusterStateRegistry.GetUnregisteredNodes(), 1)
+	mocks.allPodLister.On("List").Return([]*apiv1.Pod{}, nil).Once()
+	mocks.daemonSetLister.On("List", labels.Everything()).Return([]*appsv1.DaemonSet{}, nil).Once()
+	mocks.podDisruptionBudgetLister.On("List").Return([]*policyv1.PodDisruptionBudget{}, nil).Once()
+	mocks.onScaleDown.On("ScaleDown", "ng1", registered.Name).Return(nil).Maybe()
+
+	assert.NoError(t, autoscaler.RunOnce(t.Context(), now.Add(2*time.Minute)))
+	assert.Empty(t, deleted, "a live registered node must not be removed as unregistered")
+	mocks.onScaleDown.AssertNotCalled(t, "ScaleDown", "ng1", registered.Name)
+	mock.AssertExpectationsForObjects(t, mocks.allPodLister, mocks.daemonSetLister,
+		mocks.podDisruptionBudgetLister, mocks.onScaleUp)
 }
 
 // TODO: Refactor tests to use setupAutoscaler
@@ -2632,7 +2681,7 @@ func TestRemoveOldUnregisteredNodes(t *testing.T) {
 	provider.AddNode("ng1", ng1_1)
 	provider.AddNode("ng1", ng1_2)
 
-	fakeClient := &fake.Clientset{}
+	fakeClient := fake.NewSimpleClientset(ng1_1)
 	fakeLogRecorder, _ := clusterstate_utils.NewStatusMapRecorder(fakeClient, "kube-system", kube_record.NewFakeRecorder(5), false, "my-cool-configmap")
 
 	autoscalingCtx := &ca_context.AutoscalingContext{
@@ -2641,7 +2690,8 @@ func TestRemoveOldUnregisteredNodes(t *testing.T) {
 				MaxNodeProvisionTime: 45 * time.Minute,
 			},
 		},
-		CloudProvider: provider,
+		AutoscalingKubeClients: ca_context.AutoscalingKubeClients{ClientSet: fakeClient},
+		CloudProvider:          provider,
 	}
 	clusterState := clusterstate.NewClusterStateRegistry(provider, fakeLogRecorder, NewBackoff(), nodegroupconfig.NewDefaultNodeGroupConfigProcessor(autoscalingCtx.AutoscalingOptions.NodeGroupDefaults), nil, clusterstate.WithConfig(clusterstate.ClusterStateRegistryConfig{
 		MaxTotalUnreadyPercentage: 10,
@@ -2662,6 +2712,16 @@ func TestRemoveOldUnregisteredNodes(t *testing.T) {
 	removed, err := autoscaler.removeOldUnregisteredNodes(context.Background(), unregisteredNodes, clusterState, now.Add(-50*time.Minute), fakeLogRecorder)
 	assert.NoError(t, err)
 	assert.False(t, removed)
+	assert.Empty(t, fakeClient.Actions())
+
+	// Nothing should be removed or listed while the node group is at its min size.
+	ng1 := provider.GetNodeGroup("ng1").(*testprovider.TestNodeGroup)
+	ng1.SetTargetSize(1)
+	removed, err = autoscaler.removeOldUnregisteredNodes(context.Background(), unregisteredNodes, clusterState, now, fakeLogRecorder)
+	assert.NoError(t, err)
+	assert.False(t, removed)
+	assert.Empty(t, fakeClient.Actions())
+	ng1.SetTargetSize(2)
 
 	// ng1_2 should be removed.
 	removed, err = autoscaler.removeOldUnregisteredNodes(context.Background(), unregisteredNodes, clusterState, now, fakeLogRecorder)
@@ -2669,6 +2729,96 @@ func TestRemoveOldUnregisteredNodes(t *testing.T) {
 	assert.True(t, removed)
 	deletedNode := core_utils.GetStringFromChan(deletedNodes)
 	assert.Equal(t, "ng1/ng1-2", deletedNode)
+}
+
+func TestRemoveOldUnregisteredNodesLiveNodePages(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failPage int
+		listErr  error
+	}{
+		{name: "all pages read"},
+		{name: "first page fails", failPage: 1, listErr: apierrors.NewServiceUnavailable("unavailable")},
+		{name: "second page fails", failPage: 2, listErr: apierrors.NewServiceUnavailable("unavailable")},
+		{name: "continuation expires", failPage: 2, listErr: apierrors.NewResourceExpired("expired")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			known := BuildTestNode("known", 1000, 1000)
+			registered := BuildTestNode("registered", 1000, 1000)
+			missing := BuildTestNode("missing", 1000, 1000)
+			mocks := newCommonMocks()
+			deleted := make(chan bool, 2)
+			autoscaler, err := setupAutoscaler(&autoscalerSetupConfig{
+				nodeGroups: []*nodeGroup{{
+					name: "ng1", nodes: []*apiv1.Node{known, registered, missing}, min: 0, max: 10,
+				}},
+				nodeStateUpdateTime: now,
+				mocks:               mocks,
+				nodesDeleted:        deleted,
+				autoscalingOptions: config.AutoscalingOptions{
+					NodeGroupDefaults: config.NodeGroupAutoscalingOptions{
+						MaxNodeProvisionTime: time.Minute,
+					},
+				},
+			})
+			if !assert.NoError(t, err) {
+				return
+			}
+			assert.NoError(t, autoscaler.clusterStateRegistry.UpdateNodes(t.Context(), []*apiv1.Node{known}, now))
+			mocks.onScaleDown.On("ScaleDown", "ng1", registered.Name).Return(nil).Maybe()
+			mocks.onScaleDown.On("ScaleDown", "ng1", missing.Name).Return(nil).Maybe()
+			client := fake.NewSimpleClientset()
+			pages := 0
+			client.PrependReactor("list", "nodes", func(action k8s_testing.Action) (bool, runtime.Object, error) {
+				pages++
+				opts := action.(k8s_testing.ListActionImpl).GetListOptions()
+				assert.Positive(t, opts.Limit)
+				assert.Empty(t, opts.ResourceVersion)
+				assert.Empty(t, opts.ResourceVersionMatch)
+				assert.Empty(t, deleted, "all pages must finish before any deletion")
+				if pages == 1 {
+					assert.Empty(t, opts.Continue)
+				} else {
+					assert.Equal(t, "page-2", opts.Continue)
+				}
+				if pages == tc.failPage {
+					return true, nil, tc.listErr
+				}
+				if pages == 1 {
+					return true, &apiv1.NodeList{
+						ListMeta: metav1.ListMeta{Continue: "page-2", ResourceVersion: "123"},
+						Items:    []apiv1.Node{*known},
+					}, nil
+				}
+				liveRegistered := registered.DeepCopy()
+				liveRegistered.Name = "different-node-name"
+				differentInstance := missing.DeepCopy()
+				differentInstance.Spec.ProviderID = "another-instance"
+				return true, &apiv1.NodeList{Items: []apiv1.Node{*liveRegistered, *differentInstance}}, nil
+			})
+			autoscaler.ClientSet = client
+
+			removed, err := autoscaler.removeOldUnregisteredNodes(t.Context(),
+				autoscaler.clusterStateRegistry.GetUnregisteredNodes(),
+				autoscaler.clusterStateRegistry, now.Add(2*time.Minute), autoscaler.LogRecorder)
+			if tc.listErr != nil {
+				assert.ErrorIs(t, err, tc.listErr)
+				assert.False(t, removed)
+				assert.Empty(t, deleted)
+				assert.Equal(t, tc.failPage, pages)
+				mocks.onScaleDown.AssertNotCalled(t, "ScaleDown", "ng1", missing.Name)
+			} else {
+				assert.NoError(t, err)
+				assert.True(t, removed)
+				assert.Len(t, deleted, 1)
+				assert.Equal(t, 2, pages)
+				mocks.onScaleDown.AssertNumberOfCalls(t, "ScaleDown", 1)
+				mocks.onScaleDown.AssertCalled(t, "ScaleDown", "ng1", missing.Name)
+			}
+			mocks.onScaleDown.AssertNotCalled(t, "ScaleDown", "ng1", registered.Name)
+		})
+	}
 }
 
 func setupTestRemoveOldUnregisteredNodesAtomic(t *testing.T, now time.Time, allowNonAtomicScaleUpToMax bool) (*clusterstate.ClusterStateRegistry, *ca_context.AutoscalingContext, *clusterstate_utils.LogEventRecorder, chan string) {
@@ -2692,7 +2842,7 @@ func setupTestRemoveOldUnregisteredNodesAtomic(t *testing.T, now time.Time, allo
 		provider.AddNode("atomic-ng", node)
 	}
 
-	fakeClient := &fake.Clientset{}
+	fakeClient := fake.NewSimpleClientset(regNode)
 	fakeLogRecorder, _ := clusterstate_utils.NewStatusMapRecorder(fakeClient, "kube-system", kube_record.NewFakeRecorder(5), false, "my-cool-configmap")
 
 	autoscalingCtx := &ca_context.AutoscalingContext{
@@ -2701,7 +2851,8 @@ func setupTestRemoveOldUnregisteredNodesAtomic(t *testing.T, now time.Time, allo
 				MaxNodeProvisionTime: time.Hour,
 			},
 		},
-		CloudProvider: provider,
+		AutoscalingKubeClients: ca_context.AutoscalingKubeClients{ClientSet: fakeClient},
+		CloudProvider:          provider,
 	}
 	clusterState := clusterstate.NewClusterStateRegistry(provider, fakeLogRecorder, NewBackoff(), nodegroupconfig.NewDefaultNodeGroupConfigProcessor(autoscalingCtx.AutoscalingOptions.NodeGroupDefaults), nil, clusterstate.WithConfig(clusterstate.ClusterStateRegistryConfig{
 		MaxTotalUnreadyPercentage: 10,
@@ -2767,6 +2918,12 @@ func TestRemoveOldUnregisteredNodesAtomic(t *testing.T) {
 
 	unregisteredNodes = clusterState.GetUnregisteredNodes()
 	assert.Equal(t, 10, len(unregisteredNodes))
+
+	removed, err = autoscaler.removeOldUnregisteredNodes(t.Context(), unregisteredNodes, clusterState, now, fakeLogRecorder)
+	assert.NoError(t, err)
+	assert.False(t, removed)
+	assert.Empty(t, deletedNodes)
+	assert.NoError(t, autoscaler.ClientSet.CoreV1().Nodes().Delete(t.Context(), "atomic-ng-0", metav1.DeleteOptions{}))
 
 	// all nodes are long unregistered, so all should be removed for ZeroOrMaxNodeScaling
 	removed, err = autoscaler.removeOldUnregisteredNodes(context.Background(), unregisteredNodes, autoscaler.clusterStateRegistry, now, fakeLogRecorder)
