@@ -131,6 +131,7 @@ func TestScaleUp_EnforceMinimumResourceLimits(t *testing.T) {
 	}{
 		{name: "normal scale-up then minimum enforcement within cores", resource: cloudprovider.ResourceNameCores, minSize: 2, pendingPod: true},
 		{name: "normal scale-up then minimum enforcement within nodes", resource: resourcequotas.ResourceNodes, minSize: 2, pendingPod: true},
+		{name: "groups share the remaining cores", resource: cloudprovider.ResourceNameCores, minSize: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			options := integration.NewTestConfig().WithOverrides(func(o *config.AutoscalingOptions) {

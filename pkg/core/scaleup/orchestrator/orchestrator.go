@@ -286,6 +286,11 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 			logger.Info("ScaleUpToNodeGroupMinSize: failed to get capped node count", "err", err)
 			continue
 		}
+		// Reserve the quota so later node groups only see what is left.
+		if _, err := tracker.ConsumeQuota(ctx, o.autoscalingCtx, ng, nodeInfo.Node(), newNodeCount); err != nil {
+			logger.Info("ScaleUpToNodeGroupMinSize: failed to consume resource quotas", "err", err)
+			continue
+		}
 
 		info := nodegroupset.ScaleUpInfo{
 			Group:       ng,
