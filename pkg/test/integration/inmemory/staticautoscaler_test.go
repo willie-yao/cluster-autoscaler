@@ -23,9 +23,12 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 	fakecloudprovider "sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/test"
 	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	"sigs.k8s.io/cluster-autoscaler/pkg/core"
+	"sigs.k8s.io/cluster-autoscaler/pkg/resourcequotas"
 	"sigs.k8s.io/cluster-autoscaler/pkg/test/integration"
 	synctestutils "sigs.k8s.io/cluster-autoscaler/pkg/test/integration/synctest"
 	"sigs.k8s.io/cluster-autoscaler/pkg/utils/test"
@@ -117,6 +120,134 @@ func TestScaleUp_ResourceLimits(t *testing.T) {
 		newSize, _ := fakes.CloudProvider.GetNodeGroup("ng").TargetSize(context.Background())
 		assert.Equal(t, 2, newSize, "Should scale up after resource limit is increased")
 	})
+}
+
+func TestScaleUp_EnforceMinimumResourceLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		resource   string
+		minSize    int
+		pendingPod bool
+	}{
+		{name: "normal scale-up then minimum enforcement within cores", resource: cloudprovider.ResourceNameCores, minSize: 2, pendingPod: true},
+		{name: "normal scale-up then minimum enforcement within nodes", resource: resourcequotas.ResourceNodes, minSize: 2, pendingPod: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := integration.NewTestConfig().WithOverrides(func(o *config.AutoscalingOptions) {
+				o.ScaleDownEnabled = false
+				o.EnforceNodeGroupMinSize = true
+			}).ResolveOptions()
+			infra := integration.SetupInfrastructure(t)
+			fakes := infra.Fakes
+
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer synctestutils.TearDown(cancel)
+				autoscaler, _, err := integration.DefaultAutoscalingBuilder(options, infra).Build(ctx)
+				require.NoError(t, err)
+				template := test.BuildTestNode("template", 1000, 1000, test.IsReady(true))
+				for _, id := range []string{"ng1", "ng2"} {
+					fakes.CloudProvider.AddNodeGroup(id, fakecloudprovider.WithNodes(template, 1), fakecloudprovider.WithNGSize(tc.minSize, 4))
+					fakes.K8s.AddPod(test.BuildScheduledTestPod(id+"-pod", 600, 100, id+"-node-0"))
+				}
+				if tc.pendingPod {
+					fakes.K8s.AddPod(test.BuildTestPod("pending", 600, 100, test.MarkUnschedulable()))
+				}
+				fakes.CloudProvider.SetResourceLimit(tc.resource, 0, 3)
+
+				synctestutils.MustRunOnceAfter(t, autoscaler, 10*time.Second)
+				assert.Equal(t, 3, len(fakes.K8s.Nodes().Items), "new nodes must fit the resource limit")
+			})
+		})
+	}
+}
+
+func TestScaleUp_EnforceMinimumMaxNodesTotal(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		groups           []string
+		unmanagedNode    bool
+		pendingPod       bool
+		pendingGroups    []string
+		salvo            bool
+		existingUpcoming bool
+		startingNode     bool
+		minSize          int
+		maxNodesTotal    int
+	}{
+		{name: "one group", groups: []string{"ng1"}, unmanagedNode: true, minSize: 3, maxNodesTotal: 3},
+		{name: "groups share the allowance", groups: []string{"ng1", "ng2"}, minSize: 3, maxNodesTotal: 3},
+		{name: "normal scale-up then minimum enforcement", groups: []string{"ng1", "ng2"}, pendingPod: true, minSize: 2, maxNodesTotal: 3},
+		{name: "normal scale-up leaves room for minimum enforcement", groups: []string{"ng1", "ng2"}, pendingPod: true, minSize: 2, maxNodesTotal: 4},
+		{name: "salvo scale-ups then minimum enforcement", groups: []string{"ng1", "ng2", "ng3"}, pendingGroups: []string{"ng1", "ng2"}, salvo: true, minSize: 2, maxNodesTotal: 5},
+		{name: "existing upcoming node counts once", groups: []string{"ng1", "ng2"}, existingUpcoming: true, minSize: 3, maxNodesTotal: 3},
+		{name: "registered starting node without earlier request", groups: []string{"ng1"}, pendingPod: true, startingNode: true, minSize: 4, maxNodesTotal: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := integration.NewTestConfig().WithOverrides(func(o *config.AutoscalingOptions) {
+				o.ScaleDownEnabled = false
+				o.EnforceNodeGroupMinSize = true
+				o.MaxNodesTotal = tc.maxNodesTotal
+				o.NodeGroupDefaults.MaxNodeStartupTime = time.Minute
+				o.SalvoScaleUp = tc.salvo
+				o.SalvoScaleUpBudget = time.Minute
+			}).ResolveOptions()
+			infra := integration.SetupInfrastructure(t)
+			fakes := infra.Fakes
+
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer synctestutils.TearDown(cancel)
+				autoscaler, _, err := integration.DefaultAutoscalingBuilder(options, infra).Build(ctx)
+				require.NoError(t, err)
+				for _, id := range tc.groups {
+					template := test.BuildTestNode("template", 1000, 1000, test.IsReady(true), test.WithNodeLabels(map[string]string{"group": id}))
+					nodeCount := 1
+					if tc.startingNode {
+						nodeCount++
+					}
+					fakes.CloudProvider.AddNodeGroup(id, fakecloudprovider.WithNodes(template, nodeCount), fakecloudprovider.WithNGSize(tc.minSize, 4))
+					fakes.K8s.AddPod(test.BuildScheduledTestPod(id+"-pod", 600, 100, id+"-node-0"))
+					if tc.startingNode {
+						for _, node := range fakes.K8s.Nodes().Items {
+							if node.Name == id+"-node-1" {
+								node.CreationTimestamp.Time = time.Now()
+								test.SetNodeReadyState(&node, false, time.Now())
+								fakes.K8s.UpdateNode(&node)
+							}
+						}
+					}
+				}
+				if tc.unmanagedNode {
+					fakes.K8s.AddNode(test.BuildTestNode("unmanaged", 1000, 1000, test.IsReady(true)))
+				}
+				if tc.pendingPod {
+					fakes.K8s.AddPod(test.BuildTestPod("pending", 600, 100, test.MarkUnschedulable()))
+				}
+				for _, id := range tc.pendingGroups {
+					pod := test.BuildTestPod(id+"-pending", 600, 100, test.MarkUnschedulable())
+					pod.Spec.NodeSelector = map[string]string{"group": id}
+					fakes.K8s.AddPod(pod)
+				}
+				synctestutils.MustRunOnceAfter(t, autoscaler, 10*time.Second)
+				assert.Equal(t, tc.maxNodesTotal, len(fakes.K8s.Nodes().Items), "new nodes must fit the cluster allowance")
+				expectedNodes := tc.maxNodesTotal
+				if tc.existingUpcoming {
+					for _, node := range fakes.K8s.Nodes().Items {
+						if node.Name != "ng1-node-0" && node.Name != "ng2-node-0" {
+							node.CreationTimestamp.Time = time.Now()
+							test.SetNodeReadyState(&node, false, time.Now())
+							fakes.K8s.UpdateNode(&node)
+						}
+					}
+					expectedNodes++
+					autoscaler.(*core.StaticAutoscaler).MaxNodesTotal = expectedNodes
+				}
+				synctestutils.MustRunOnceAfter(t, autoscaler, 10*time.Second)
+				assert.Equal(t, expectedNodes, len(fakes.K8s.Nodes().Items), "minimum enforcement must use the remaining allowance")
+			})
+		})
+	}
 }
 
 // TestFixNodeGroupSize_ZeroOrMaxNodeScaling verifies that fixNodeGroupSize skips

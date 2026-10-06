@@ -556,15 +556,16 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 		return nil
 	}
 
+	nodes := make([]*apiv1.Node, len(allNodeInfos))
+	for i, nodeInfo := range allNodeInfos {
+		nodes[i] = nodeInfo.Node()
+	}
+
 	if shouldScaleUp {
 		scaleUpTriggered = true
-		nodes := make([]*apiv1.Node, len(allNodeInfos))
-		for i, nodeInfo := range allNodeInfos {
-			nodes[i] = nodeInfo.Node()
-		}
 
 		if a.AutoscalingContext.AutoscalingOptions.SalvoScaleUp {
-			scaleUpStatus, typedErr = a.runScaleUpSalvo(ctx, currentTime,
+			scaleUpStatus, nodes, typedErr = a.runScaleUpSalvo(ctx, currentTime,
 				unschedulablePodsToHelp,
 				daemonsets,
 				nodes,
@@ -592,11 +593,14 @@ func (a *StaticAutoscaler) RunOnce(ctx context.Context, currentTime time.Time) c
 	}
 
 	if a.EnforceNodeGroupMinSize {
-		scaleUpTriggered = true
-		nodes := make([]*apiv1.Node, len(allNodeInfos))
-		for i, nodeInfo := range allNodeInfos {
-			nodes[i] = nodeInfo.Node()
+		// Count the nodes requested by the scale-up above against the cluster limits.
+		newNodes, err := getScaleUpResultNodes(ctx, scaleUpStatus, templateNodeInfos)
+		if err != nil {
+			logger.Error(err, "Failed to build nodes from scale-up results")
+			return caerrors.ToAutoscalerError(caerrors.InternalError, err)
 		}
+		nodes = append(nodes, newNodes...)
+		scaleUpTriggered = true
 
 		scaleUpFn := func() (*status.ScaleUpStatus, caerrors.AutoscalerError) {
 			return a.scaleUpOrchestrator.ScaleUpToNodeGroupMinSize(ctx, nodes, templateNodeInfos)
@@ -698,6 +702,8 @@ func (a *StaticAutoscaler) runSingleScaleUp(
 	return a.instrumentedScaleUp(ctx, currentTime, scaleUpFn)
 }
 
+// runScaleUpSalvo repeats scale-ups until all pods are helped or the budget runs out. The returned nodes
+// include placeholders for every scale-up except the one in the returned status.
 func (a *StaticAutoscaler) runScaleUpSalvo(
 	ctx context.Context,
 	currentTime time.Time,
@@ -705,7 +711,7 @@ func (a *StaticAutoscaler) runScaleUpSalvo(
 	daemonsets []*v1.DaemonSet,
 	nodes []*apiv1.Node,
 	templateNodeInfos map[string]*framework.NodeInfo,
-) (*status.ScaleUpStatus, caerrors.AutoscalerError) {
+) (*status.ScaleUpStatus, []*apiv1.Node, caerrors.AutoscalerError) {
 	logger := klog.FromContext(ctx)
 	var scaleUpStatus *status.ScaleUpStatus
 	var typedErr caerrors.AutoscalerError
@@ -764,7 +770,7 @@ func (a *StaticAutoscaler) runScaleUpSalvo(
 		nodes = append(nodes, newNodes...)
 	}
 	logger.Info("Finished scale up salvo", "iterationCount", i, "unschedulablePodsCount", len(podsMap))
-	return scaleUpStatus, typedErr
+	return scaleUpStatus, nodes, typedErr
 }
 
 func (a *StaticAutoscaler) updateSoftDeletionTaints(ctx context.Context, allNodes []*apiv1.Node) {
@@ -962,6 +968,25 @@ func (a *StaticAutoscaler) addLatestScaleUpResultsToClusterSnapshot(ctx context.
 	}
 
 	return newNodes, nil
+}
+
+// getScaleUpResultNodes builds placeholder nodes for the node group increases in scaleUpStatus.
+func getScaleUpResultNodes(ctx context.Context, scaleUpStatus *status.ScaleUpStatus, templateNodeInfos map[string]*framework.NodeInfo) ([]*apiv1.Node, error) {
+	upcomingCounts := make(map[string]int)
+	for _, suInfo := range scaleUpStatus.ScaleUpInfos {
+		upcomingCounts[suInfo.Group.Id()] += suInfo.NewSize - suInfo.CurrentSize
+	}
+	upcomingNodeInfosPerNg, err := getUpcomingNodeInfos(ctx, upcomingCounts, templateNodeInfos, "scale-up-%d")
+	if err != nil {
+		return nil, err
+	}
+	var nodes []*apiv1.Node
+	for _, upcomingNodeInfos := range upcomingNodeInfosPerNg {
+		for _, upcomingNodeInfo := range upcomingNodeInfos {
+			nodes = append(nodes, upcomingNodeInfo.Node())
+		}
+	}
+	return nodes, nil
 }
 
 func (a *StaticAutoscaler) isScaleDownInCooldown(currentTime time.Time) bool {
