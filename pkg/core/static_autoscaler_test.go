@@ -551,6 +551,63 @@ func TestStaticAutoscalerRunOnce(t *testing.T) {
 	mock.AssertExpectationsForObjects(t, onScaleUpMock)
 }
 
+func TestStaticAutoscalerRunOnceEnforceMinSizeAfterPartialScaleUp(t *testing.T) {
+	now := time.Now()
+	n1 := BuildTestNode("n1", 1000, 1000)
+	SetNodeReadyState(n1, true, now)
+	n2 := BuildTestNode("n2", 1000, 1000)
+	SetNodeReadyState(n2, true, now)
+	n3 := BuildTestNode("n3", 500, 1000)
+	SetNodeReadyState(n3, true, now)
+	allNodes := []*apiv1.Node{n1, n2, n3}
+
+	p1 := BuildTestPod("p1", 600, 100)
+	p1.Spec.NodeName = "n1"
+	p2 := BuildTestPod("p2", 600, 100)
+	p2.Spec.NodeName = "n2"
+	p3 := BuildTestPod("p3", 600, 100, MarkUnschedulable())
+	p4 := BuildTestPod("p4", 600, 100, MarkUnschedulable())
+
+	mocks := newCommonMocks()
+	mocks.readyNodeLister.SetNodes(allNodes)
+	mocks.allNodeLister.SetNodes(allNodes)
+	mocks.allPodLister.On("List").Return([]*apiv1.Pod{p1, p2, p3, p4}, nil)
+	mocks.daemonSetLister.On("List", labels.Everything()).Return([]*appsv1.DaemonSet{}, nil)
+	mocks.podDisruptionBudgetLister.On("List").Return([]*policyv1.PodDisruptionBudget{}, nil)
+	// The pending pods are balanced between ng1 and ng2, and only the ng1 scale-up succeeds.
+	mocks.onScaleUp.On("ScaleUp", "ng1", 1).Return(nil).Once()
+	mocks.onScaleUp.On("ScaleUp", "ng2", 1).Return(fmt.Errorf("provider error")).Once()
+	mocks.onScaleUp.On("ScaleUp", "ng3", mock.Anything).Return(nil).Once()
+
+	autoscaler, err := setupAutoscaler(&autoscalerSetupConfig{
+		nodeGroups: []*nodeGroup{
+			{name: "ng1", nodes: []*apiv1.Node{n1}, min: 1, max: 10},
+			{name: "ng2", nodes: []*apiv1.Node{n2}, min: 1, max: 10},
+			{name: "ng3", nodes: []*apiv1.Node{n3}, min: 3, max: 10},
+		},
+		nodeStateUpdateTime: now,
+		autoscalingOptions: config.AutoscalingOptions{
+			NodeGroupDefaults: config.NodeGroupAutoscalingOptions{
+				MaxNodeProvisionTime: 10 * time.Second,
+			},
+			EstimatorName:                  estimator.BinpackingEstimatorName,
+			EnforceNodeGroupMinSize:        true,
+			BalanceSimilarNodeGroups:       true,
+			ParallelScaleUp:                true,
+			MaxNodesTotal:                  5,
+			MaxNodeGroupBinpackingDuration: 1 * time.Second,
+		},
+		mocks: mocks,
+	})
+	assert.NoError(t, err)
+
+	err = autoscaler.RunOnce(t.Context(), now.Add(time.Hour))
+	assert.NoError(t, err)
+	mocks.onScaleUp.AssertExpectations(t)
+	// Only the ng1 node from the partial scale-up counts, so one node is left for ng3.
+	mocks.onScaleUp.AssertCalled(t, "ScaleUp", "ng3", 1)
+}
+
 func TestStaticAutoscalerRunOnceWithScaleDownDelayPerNG(t *testing.T) {
 	onScaleUpMock := &onScaleUpMock{}
 	onScaleDownMock := &onScaleDownMock{}

@@ -170,8 +170,16 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 	if aErr != nil {
 		failedGroupsMap := o.buildFailedGroupsMap(failedNodeGroups, plan.scaleUpInfos)
 		markedEquivalenceGroups := markFailedGroupsAsUnschedulable(podEquivalenceGroups, failedGroupsMap, ScaleUpExecutionErrorReason)
+		// Report the scale-ups that succeeded, so that callers can account for the new nodes.
+		var executedScaleUpInfos []nodegroupset.ScaleUpInfo
+		for _, info := range plan.scaleUpInfos {
+			if !failedGroupsMap[info.Group.Id()] {
+				executedScaleUpInfos = append(executedScaleUpInfos, info)
+			}
+		}
 		return status.UpdateScaleUpError(
 			&status.ScaleUpStatus{
+				ScaleUpInfos:            executedScaleUpInfos,
 				CreateNodeGroupResults:  plan.createNodeGroupResults,
 				FailedResizeNodeGroups:  failedNodeGroups,
 				PodsTriggeredScaleUp:    plan.bestOption.Pods,
@@ -225,6 +233,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 	now := time.Now()
 	nodeGroups := o.autoscalingCtx.CloudProvider.NodeGroups(ctx)
 	scaleUpInfos := make(nodegroupset.ScaleUpInfos, 0)
+	currentNodeCount := len(nodes)
 
 	tracker, err := o.quotasTrackerFactory.NewQuotasTracker(ctx, o.autoscalingCtx, nodes)
 	if err != nil {
@@ -272,9 +281,14 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 		}
 		newNodeCount = checkResult.AllowedDelta
 
-		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, targetSize)
+		newNodeCount, err = o.GetCappedNewNodeCount(ctx, newNodeCount, currentNodeCount)
 		if err != nil {
 			logger.Info("ScaleUpToNodeGroupMinSize: failed to get capped node count", "err", err)
+			continue
+		}
+		// Reserve the quota so later node groups only see what is left.
+		if _, err := tracker.ConsumeQuota(ctx, o.autoscalingCtx, ng, nodeInfo.Node(), newNodeCount); err != nil {
+			logger.Info("ScaleUpToNodeGroupMinSize: failed to consume resource quotas", "err", err)
 			continue
 		}
 
@@ -285,6 +299,7 @@ func (o *ScaleUpOrchestrator) ScaleUpToNodeGroupMinSize(
 			MaxSize:     ng.MaxSize(ctx),
 		}
 		scaleUpInfos = append(scaleUpInfos, info)
+		currentNodeCount += newNodeCount
 	}
 
 	if len(scaleUpInfos) == 0 {
