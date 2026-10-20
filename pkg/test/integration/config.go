@@ -125,6 +125,20 @@ func WithMaxNodesTotal(n int) AutoscalingOptionOverride {
 	}
 }
 
+// WithSalvoScaleUp enables repeated scale-ups within a single loop.
+func WithSalvoScaleUp() AutoscalingOptionOverride {
+	return func(o *config.AutoscalingOptions) {
+		o.SalvoScaleUp = true
+	}
+}
+
+// WithSalvoScaleUpBudget sets the time budget for a scale-up salvo.
+func WithSalvoScaleUpBudget(d time.Duration) AutoscalingOptionOverride {
+	return func(o *config.AutoscalingOptions) {
+		o.SalvoScaleUpBudget = d
+	}
+}
+
 // WithProvisioningRequestEnabled enables ProvisioningRequest support.
 func WithProvisioningRequestEnabled() AutoscalingOptionOverride {
 	return func(o *config.AutoscalingOptions) {

@@ -315,6 +315,8 @@ type loopState struct {
 	allNodes                 []*apiv1.Node
 	readyNodes               []*apiv1.Node
 	allNodeInfos             []*framework.NodeInfo
+	scaleUpNodes             []*apiv1.Node
+	templateNodeInfos        map[string]*framework.NodeInfo
 	daemonsets               []*v1.DaemonSet
 	podsBySchedulability     kube_util.PodsBySchedulability
 	unschedulablePodsToHelp  []*apiv1.Pod
@@ -638,27 +640,28 @@ func (a *StaticAutoscaler) scaleUp(ctx context.Context, state *loopState) caerro
 		return nil
 	}
 
+	state.scaleUpNodes = make([]*apiv1.Node, len(state.allNodeInfos))
+	for i, nodeInfo := range state.allNodeInfos {
+		state.scaleUpNodes[i] = nodeInfo.Node()
+	}
+
+	// TODO(Choraden): Stop passing templateNodeInfos explicitly once
+	// scaleup.Orchestrator no longer takes it as an argument.
+	// GetNodeInfos() returns a fresh copy on every call, so it has to be
+	// fetched once here and shared by every iteration of a scale-up salvo:
+	// some Orchestrator implementations modify this map during ScaleUp and
+	// later iterations rely on seeing those modifications.
+	state.templateNodeInfos = a.AutoscalingContext.TemplateNodeInfoRegistry.GetNodeInfos()
+
 	shouldScaleUp := a.shouldScaleUp(ctx, state)
 	if shouldScaleUp {
 		state.scaleUpTriggered = true
-		nodes := make([]*apiv1.Node, len(state.allNodeInfos))
-		for i, nodeInfo := range state.allNodeInfos {
-			nodes[i] = nodeInfo.Node()
-		}
-
-		// TODO(Choraden): Stop passing templateNodeInfos explicitly once
-		// scaleup.Orchestrator no longer takes it as an argument.
-		// GetNodeInfos() returns a fresh copy on every call, so it has to be
-		// fetched once here and shared by every iteration of a scale-up salvo:
-		// some Orchestrator implementations modify this map during ScaleUp and
-		// later iterations rely on seeing those modifications.
-		templateNodeInfos := a.AutoscalingContext.TemplateNodeInfoRegistry.GetNodeInfos()
 
 		var typedErr caerrors.AutoscalerError
 		if a.AutoscalingContext.AutoscalingOptions.SalvoScaleUp {
-			state.scaleUpStatus, typedErr = a.runScaleUpSalvo(ctx, state, nodes, templateNodeInfos)
+			state.scaleUpStatus, state.scaleUpNodes, typedErr = a.runScaleUpSalvo(ctx, state, state.scaleUpNodes, state.templateNodeInfos)
 		} else {
-			_, state.scaleUpStatus, typedErr = a.runSingleScaleUp(ctx, state, nodes, templateNodeInfos)
+			_, state.scaleUpStatus, typedErr = a.runSingleScaleUp(ctx, state, state.scaleUpNodes, state.templateNodeInfos)
 		}
 
 		if state.scaleUpStatus != nil && state.scaleUpStatus.Result == status.ScaleUpSuccessful {
@@ -683,15 +686,17 @@ func (a *StaticAutoscaler) scaleUpMinNodes(ctx context.Context, state *loopState
 	}
 
 	if a.EnforceNodeGroupMinSize {
-		state.scaleUpTriggered = true
-		nodes := make([]*apiv1.Node, len(state.allNodeInfos))
-		for i, nodeInfo := range state.allNodeInfos {
-			nodes[i] = nodeInfo.Node()
+		// Count the nodes requested by the scale-up above against the cluster limits.
+		newNodes, err := getScaleUpResultNodes(ctx, state.scaleUpStatus, state.templateNodeInfos)
+		if err != nil {
+			klog.FromContext(ctx).Error(err, "Failed to build nodes from scale-up results")
+			return caerrors.ToAutoscalerError(caerrors.InternalError, err)
 		}
+		state.scaleUpNodes = append(state.scaleUpNodes, newNodes...)
+		state.scaleUpTriggered = true
 
-		templateNodeInfos := a.AutoscalingContext.TemplateNodeInfoRegistry.GetNodeInfos()
 		scaleUpFn := func() (*status.ScaleUpStatus, caerrors.AutoscalerError) {
-			return a.scaleUpOrchestrator.ScaleUpToNodeGroupMinSize(ctx, nodes, templateNodeInfos)
+			return a.scaleUpOrchestrator.ScaleUpToNodeGroupMinSize(ctx, state.scaleUpNodes, state.templateNodeInfos)
 		}
 		var typedErr caerrors.AutoscalerError
 		_, state.scaleUpStatus, typedErr = a.instrumentedScaleUp(ctx, state.currentTime, scaleUpFn)
@@ -821,7 +826,9 @@ func (a *StaticAutoscaler) runSingleScaleUp(ctx context.Context, state *loopStat
 	return a.instrumentedScaleUp(ctx, state.currentTime, scaleUpFn)
 }
 
-func (a *StaticAutoscaler) runScaleUpSalvo(ctx context.Context, state *loopState, nodes []*apiv1.Node, templateNodeInfos map[string]*framework.NodeInfo) (*status.ScaleUpStatus, caerrors.AutoscalerError) {
+// runScaleUpSalvo repeats scale-ups until all pods are helped or the budget runs out. The returned nodes
+// include placeholders for every scale-up except the one in the returned status.
+func (a *StaticAutoscaler) runScaleUpSalvo(ctx context.Context, state *loopState, nodes []*apiv1.Node, templateNodeInfos map[string]*framework.NodeInfo) (*status.ScaleUpStatus, []*apiv1.Node, caerrors.AutoscalerError) {
 	logger := klog.FromContext(ctx)
 	var scaleUpStatus *status.ScaleUpStatus
 	var typedErr caerrors.AutoscalerError
@@ -880,7 +887,7 @@ func (a *StaticAutoscaler) runScaleUpSalvo(ctx context.Context, state *loopState
 		nodes = append(nodes, newNodes...)
 	}
 	logger.Info("Finished scale up salvo", "iterationCount", i, "unschedulablePodsCount", len(podsMap))
-	return scaleUpStatus, typedErr
+	return scaleUpStatus, nodes, typedErr
 }
 
 func (a *StaticAutoscaler) updateSoftDeletionTaints(ctx context.Context, allNodes []*apiv1.Node) {
@@ -1085,6 +1092,25 @@ func (a *StaticAutoscaler) addLatestScaleUpResultsToClusterSnapshot(ctx context.
 	}
 
 	return newNodes, nil
+}
+
+// getScaleUpResultNodes builds placeholder nodes for the node group increases in scaleUpStatus.
+func getScaleUpResultNodes(ctx context.Context, scaleUpStatus *status.ScaleUpStatus, templateNodeInfos map[string]*framework.NodeInfo) ([]*apiv1.Node, error) {
+	upcomingCounts := make(map[string]int)
+	for _, suInfo := range scaleUpStatus.ScaleUpInfos {
+		upcomingCounts[suInfo.Group.Id()] += suInfo.NewSize - suInfo.CurrentSize
+	}
+	upcomingNodeInfosPerNg, err := getUpcomingNodeInfos(ctx, upcomingCounts, templateNodeInfos, "scale-up-%d")
+	if err != nil {
+		return nil, err
+	}
+	var nodes []*apiv1.Node
+	for _, upcomingNodeInfos := range upcomingNodeInfosPerNg {
+		for _, upcomingNodeInfo := range upcomingNodeInfos {
+			nodes = append(nodes, upcomingNodeInfo.Node())
+		}
+	}
+	return nodes, nil
 }
 
 func (a *StaticAutoscaler) isScaleDownInCooldown(currentTime time.Time) bool {

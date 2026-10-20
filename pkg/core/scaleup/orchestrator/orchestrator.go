@@ -170,8 +170,16 @@ func (o *ScaleUpOrchestrator) ScaleUp(
 	if aErr != nil {
 		failedGroupsMap := o.buildFailedGroupsMap(failedNodeGroups, plan.scaleUpInfos)
 		markedEquivalenceGroups := markFailedGroupsAsUnschedulable(podEquivalenceGroups, failedGroupsMap, ScaleUpExecutionErrorReason)
+		// Report the scale-ups that succeeded, so that callers can account for the new nodes.
+		var executedScaleUpInfos []nodegroupset.ScaleUpInfo
+		for _, info := range plan.scaleUpInfos {
+			if !failedGroupsMap[info.Group.Id()] {
+				executedScaleUpInfos = append(executedScaleUpInfos, info)
+			}
+		}
 		return status.UpdateScaleUpError(
 			&status.ScaleUpStatus{
+				ScaleUpInfos:            executedScaleUpInfos,
 				CreateNodeGroupResults:  plan.createNodeGroupResults,
 				FailedResizeNodeGroups:  failedNodeGroups,
 				PodsTriggeredScaleUp:    plan.bestOption.Pods,
