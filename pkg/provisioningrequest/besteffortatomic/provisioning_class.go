@@ -167,7 +167,8 @@ func (o *bestEffortAtomicProvClass) Provision(
 		logger.Error(updateErr, "failed to add Provisioned=false condition to ProvReq", "provReq", klog.KObj(pr))
 	}
 	if err != nil {
-		return status.UpdateScaleUpError(&status.ScaleUpStatus{}, errors.NewAutoscalerErrorf(errors.InternalError, "error during ScaleUp: %s", err.Error()))
+		// Keep the scale-ups that succeeded, so that callers can account for the new nodes.
+		return status.UpdateScaleUpError(&status.ScaleUpStatus{ScaleUpInfos: st.ScaleUpInfos}, errors.NewAutoscalerErrorf(errors.InternalError, "error during ScaleUp: %s", err.Error()))
 	}
 	return st, nil
 }
